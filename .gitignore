@@ -1,0 +1,36 @@
+# Git ignore file for Gelegram project
+# Secrets and runtime files that should never be committed
+
+# ── Environment secrets ────────────────────────────────────────────────
+.env
+# .env.example IS committed intentionally — it's the configuration template
+
+# ── Python build artifacts ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Runtime logs ──────────────────────────────────────────────────────
+*.log
+
+# ── Runtime state files ───────────────────────────────────────────────
+bot.pid
+trusted_users.json
+
+# ── Service / Gateway artifacts ───────────────────────────────────────
+tools/
+logs/
+
+# ── Default agentic workspace ──────────────────────────────────────────
+workdir/
+
+# ── IDE files ──────────────────────────────────────────────────────────
+.vscode/
+.idea/

@@ -1,0 +1,10 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Gelegram – Python Dependencies
+#  Install with:  uv pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────
+
+# Telegram Bot SDK (async, v20+)
+python-telegram-bot[job-queue]>=20.0
+
+# .env file loader
+python-dotenv>=1.0.0
