@@ -1,11 +1,15 @@
 # Gelegram 🤖
 
-> **A Telegram bot that bridges your conversations to Google Gemini via the ACP (Agent Communication Protocol) server — with persistent memory, multi-chat support, file transfers, and a production-ready Windows service.**
+> **Your personal AI agent — accessible from Telegram, powered by Gemini. It knows who you are, remembers what matters, learns new skills, and keeps running 24/7 as a Windows service.**
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://python.org)
 [![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-required-4285F4?logo=google)](https://github.com/google-gemini/gemini-cli)
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows)](https://microsoft.com/windows)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+Gelegram is a **lightweight, self-hosted AI agent** built on the Gemini CLI. Think of it as your own pocket **OpenClaw** — an agent with a **persistent identity**, **long and short-term memory**, and a **pluggable skills system** — all accessible from your phone via Telegram.
+
+You define who the agent is on first run. It remembers your preferences, your projects, your history. You can extend it with custom skills, and it can read/write files, run scripts, and search the web. Throw files at it, ask it complex tasks, and it'll send results straight back to your chat.
 
 ---
 
@@ -13,18 +17,20 @@
 
 | Feature | Details |
 |---------|---------|
-| 🗣️ **Full Gemini CLI ACP bridge** | JSON-RPC 2.0 over stdio — real-time streaming responses |
-| 👥 **Multi-chat isolation** | Each Telegram chat gets its own independent Gemini session |
-| 📎 **File attachments** | Send photos, documents, audio or video to Gemini; Gemini can send files back |
-| 🖼️ **Media album support** | Send multiple photos in one Telegram album — all delivered together |
-| 🔒 **Password authentication** | Optional bot password to restrict access |
+| 🧠 **Persistent identity** | Agent has a name, personality, and memory that survive restarts |
+| 💾 **Long-term memory** | Curated `MEMORY.md` — facts, preferences, lessons, project history |
+| 📅 **Short-term memory** | Daily session logs distilled into `memory/YYYY-MM-DD.md` summaries |
+| 🔧 **Pluggable skills** | Drop a `SKILL.md` + scripts into `skills/` and the agent gains new abilities |
+| 🗣️ **Gemini CLI ACP bridge** | JSON-RPC 2.0 over stdio — real-time streaming responses |
+| 👥 **Multi-chat isolation** | Each Telegram chat gets its own independent agent session |
+| 📎 **File attachments** | Send photos, docs, audio or video — Gemini can send files back |
+| 🖼️ **Media album support** | Multiple photos in one album are delivered to the agent together |
+| 🔒 **Password authentication** | Restrict access with an optional bot password |
 | 🕵️ **Private mode** | Toggle transcript logging per session with `/private` |
-| ⚡ **Auto-tool approval** | Gemini tool calls (file edits, shell commands) are auto-approved |
-| 🔄 **Auto-restart** | ACP subprocess is restarted automatically if it crashes |
-| 🧠 **Agentic workspace** | Full markdown-based memory + skills system scaffolded automatically |
-| 🛑 **Request cancellation** | `/kill` stops a long-running task without resetting the session |
-| 🖥️ **Windows service** | Run as a background service via NSSM with a one-command installer |
-| 📊 **Session transcripts** | Every conversation is logged to `transcripts/` for memory distillation |
+| ⚡ **Auto-tool approval** | File edits, shell commands, web search — all auto-approved |
+| 🛑 **Task cancellation** | `/kill` stops a long-running task without resetting the session |
+| 🖥️ **Windows service** | Run 24/7 via NSSM — auto-starts on boot, survives crashes |
+| 🔄 **Watchdog gateway** | Exponential backoff restart if the agent process crashes |
 
 ---
 
@@ -99,7 +105,7 @@ gemini
 ### 1. Clone the Repository
 
 ```powershell
-git clone https://github.com/yourusername/gelegram.git
+git clone https://github.com/krazyguy/gelegram.git
 cd gelegram
 ```
 
