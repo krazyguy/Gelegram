@@ -13,6 +13,34 @@ You define who the agent is on first run. It remembers your preferences, your pr
 
 ---
 
+## 🚀 Quick Start
+
+> **Prerequisites:** [Node.js 18+](https://nodejs.org) · [Python 3.11+](https://python.org) · [uv](https://github.com/astral-sh/uv) · A Telegram bot token from [@BotFather](https://t.me/BotFather)
+
+```powershell
+# 1. Install Gemini CLI and authenticate (one-time)
+npm install -g @google/gemini-cli
+gemini   # completes Google OAuth — close it after login
+
+# 2. Clone and set up the project
+git clone https://github.com/krazyguy/Gelegram.git
+cd Gelegram
+uv venv .venv
+.venv\Scripts\activate
+uv pip install -r requirements.txt
+
+# 3. Configure
+Copy-Item .env.example .env
+# Edit .env — paste your TELEGRAM_BOT_TOKEN at minimum
+
+# 4. Run
+python bot.py
+```
+
+**That's it.** Message your bot on Telegram — on the **first message**, the agent will introduce itself and walk you through setting up its identity (name, personality, rules). After that it's yours. 🎉
+
+---
+
 ## ✨ Features
 
 | Feature | Details |
