@@ -97,6 +97,14 @@ if not _work_dir.exists():
 from workspace_init import init_workspace
 init_workspace(_work_dir)
 
+# Detect if this is a fresh workspace that needs the agent to run bootstrap.
+# SOUL.md is created by the agent during interactive Bootstrap Mode — its absence
+# means the agent hasn't been configured yet and we need to send a primer prompt
+# after the ACP handshake so Gemini reads GEMINI.md automatically.
+_NEEDS_BOOTSTRAP = not (_work_dir / "SOUL.md").exists()
+if _NEEDS_BOOTSTRAP:
+    logger.info("Fresh workspace detected (no SOUL.md) — bootstrap primer will be sent on first session.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ACP Client — manages one persistent gemini --acp subprocess
@@ -124,6 +132,12 @@ class GeminiACPClient:
         self._transcript_file: Optional[Path] = None
         self._active_req_id: Optional[int] = None
         self.private_mode: bool = False
+        # Bootstrap primer: when the workspace is fresh (no SOUL.md), we send
+        # an automatic first prompt after the ACP handshake telling Gemini to
+        # read GEMINI.md and enter Bootstrap Mode. The primer response is cached
+        # and prepended to the first real user response.
+        self._bootstrap_response: Optional[str] = None
+        self._bootstrap_sent: bool = False
 
     # ── Private helpers ──────────────────────────────────────────────────────
 
@@ -370,6 +384,56 @@ class GeminiACPClient:
 
         self._initialized = True
 
+        # ── Bootstrap Primer ──────────────────────────────────────────────
+        # On a fresh workspace (no SOUL.md), automatically send a primer
+        # prompt that tells Gemini to read GEMINI.md and enter Bootstrap Mode.
+        # This ensures the agent's first interaction with the user already
+        # has its bootstrap context loaded, instead of giving a generic greeting.
+        # NOTE: We do a live filesystem check here (not the module-level
+        # _NEEDS_BOOTSTRAP flag) so that after /reset, if SOUL.md was created
+        # during a previous session, we don't re-trigger bootstrap.
+        needs_bootstrap_now = not (_work_dir / "SOUL.md").exists()
+        if needs_bootstrap_now and not self._bootstrap_sent:
+            logger.info("Sending bootstrap primer prompt to Gemini …")
+            primer_id = self._next_id()
+            await self._send({
+                "jsonrpc": "2.0",
+                "id": primer_id,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": self._session_id,
+                    "prompt": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "[SYSTEM] This is an automated bootstrap trigger. "
+                                "Read GEMINI.md in this workspace immediately and follow "
+                                "the instructions under 'First-Run Initialization (Bootstrap Mode)'. "
+                                "SOUL.md does not exist yet — you are in Bootstrap Mode. "
+                                "Greet the user and begin the identity configuration questions "
+                                "as specified in GEMINI.md. Do NOT skip any steps."
+                            ),
+                        }
+                    ],
+                },
+            })
+            try:
+                result = await self._recv_response(primer_id, timeout=60)
+                # Extract and cache the bootstrap response text
+                primer_text = ""
+                if "_notification_text" in result and result["_notification_text"].strip():
+                    primer_text = result["_notification_text"].strip()
+                elif "text" in result and result["text"]:
+                    primer_text = str(result["text"]).strip()
+                if primer_text:
+                    self._bootstrap_response = primer_text
+                    logger.info("Bootstrap primer response cached (%d chars)", len(primer_text))
+                else:
+                    logger.warning("Bootstrap primer returned empty response: %s", result)
+            except Exception as e:
+                logger.error("Bootstrap primer failed (non-fatal): %s", e)
+            self._bootstrap_sent = True
+
     # ── Process lifecycle ────────────────────────────────────────────────────
 
     async def _start_process(self) -> None:
@@ -483,6 +547,10 @@ class GeminiACPClient:
         self._session_id  = None
         self._active_req_id = None
         self.private_mode = False
+        self._bootstrap_response = None
+        # Re-check SOUL.md on next session start — if the user completed
+        # bootstrap before resetting, we don't want to re-trigger it.
+        self._bootstrap_sent = False
 
     async def cancel_active_request(self) -> bool:
         """Attempt to cancel the currently running request gracefully without killing the process."""
@@ -509,6 +577,10 @@ class GeminiACPClient:
         This method is serialised by an asyncio.Lock so that concurrent
         Telegram messages do not interleave JSON-RPC ids on the stdio stream.
 
+        If a bootstrap primer response was cached (from a fresh workspace),
+        it is returned instead of sending a new prompt — this ensures the
+        user sees the bootstrap greeting on their very first message.
+
         Raises:
             RuntimeError   – ACP protocol error returned by gemini-cli
             asyncio.TimeoutError – No response within ACP_TIMEOUT seconds
@@ -517,6 +589,61 @@ class GeminiACPClient:
         async with self._lock:
             # Restart process if it crashed since the last call
             await self._ensure_running()
+
+            # ── Bootstrap primer intercept ────────────────────────────────
+            # If we cached a bootstrap primer response, return it for the
+            # user's very first message so they see the identity setup
+            # questions immediately.  The primer already primed the Gemini
+            # session context, so subsequent messages flow normally.
+            if self._bootstrap_response is not None:
+                cached = self._bootstrap_response
+                self._bootstrap_response = None  # consume once
+                logger.info("Returning cached bootstrap primer response to user")
+
+                # Still log the user message + bootstrap response to transcript
+                if self._transcript_file and not self.private_mode:
+                    import datetime
+                    time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open(self._transcript_file, "a", encoding="utf-8") as f:
+                        f.write(f"{time_str} : {user_name} : {text}\n")
+                        f.write(f"{time_str} : gemini : {cached}\n")
+
+                # Forward the user's actual text to Gemini so the agent has
+                # it in its context for the next turn (non-blocking fire-and-forget
+                # would be complex here — instead we send it and use the response
+                # ONLY if the bootstrap response was empty for some reason).
+                prompt_id = self._next_id()
+                self._active_req_id = prompt_id
+                await self._send({
+                    "jsonrpc": "2.0",
+                    "id": prompt_id,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": self._session_id,
+                        "prompt": [
+                            {"type": "text", "text": text}
+                        ],
+                    },
+                })
+                try:
+                    followup = await self._recv_response(prompt_id, timeout=ACP_TIMEOUT)
+                    # Extract followup text in case bootstrap primer + user text
+                    # triggers additional relevant output
+                    followup_text = ""
+                    if "_notification_text" in followup and followup["_notification_text"].strip():
+                        followup_text = followup["_notification_text"].strip()
+                    elif "text" in followup and followup["text"]:
+                        followup_text = str(followup["text"]).strip()
+                    if followup_text:
+                        # Combine: show bootstrap greeting + any followup
+                        cached = cached + "\n\n" + followup_text
+                        logger.info("Appended followup response (%d chars)", len(followup_text))
+                except Exception as e:
+                    logger.warning("Followup after bootstrap primer failed (non-fatal): %s", e)
+                finally:
+                    self._active_req_id = None
+
+                return cached
 
             # Log user message to transcript
             if self._transcript_file and not self.private_mode:
