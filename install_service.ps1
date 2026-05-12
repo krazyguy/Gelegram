@@ -45,6 +45,24 @@ $RunAsPlain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($RunAsPassword)
 )
 
+# -- Resolve the real USERPROFILE for the service account ---------------------
+# When signed in with a Microsoft / email account, the service token may not
+# carry the correct USERPROFILE.  We resolve it now (while running interactively
+# as the actual user) and persist it so the service can restore it at runtime.
+# NOTE: $ScriptDir and helper functions (Write-Ok etc.) are defined further below;
+#       the file write is deferred until after they are available.
+$RealUserProfile = $env:USERPROFILE
+Write-Host "  Detected USERPROFILE : $RealUserProfile" -ForegroundColor Cyan
+
+# Verify the .gemini folder exists so we catch mismatched accounts early
+$GeminiDir = Join-Path $RealUserProfile ".gemini"
+if (-not (Test-Path $GeminiDir)) {
+    Write-Host "    [!] WARNING: .gemini directory not found at '$GeminiDir'." -ForegroundColor Yellow
+    Write-Host "    [!] Gemini CLI auth may fail until you run 'gemini auth' as this user." -ForegroundColor Yellow
+} else {
+    Write-Host "    [OK] .gemini directory confirmed: $GeminiDir" -ForegroundColor Green
+}
+
 # Resolve paths relative to this script's location
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $GatewayScript = Join-Path $ScriptDir "gateway.py"
@@ -53,6 +71,12 @@ $BatLauncher = Join-Path $ScriptDir "run_gateway.bat"
 $NssmDir = Join-Path $ScriptDir "tools"
 $NssmExe = Join-Path $NssmDir "nssm.exe"
 $LogDir = Join-Path $ScriptDir "logs"
+
+# Persist USERPROFILE hint now that $ScriptDir is available
+# (run_gateway.bat and bot.py read this at service startup to restore env)
+$ProfileHintFile = Join-Path $ScriptDir "service_userprofile.txt"
+$RealUserProfile | Out-File -FilePath $ProfileHintFile -Encoding ascii -NoNewline
+Write-Host "    [OK] Saved USERPROFILE hint: $ProfileHintFile" -ForegroundColor Green
 
 # NSSM download URL (portable, no installer needed)
 # Using the stable 2.24 release - widely tested and reliable
@@ -265,6 +289,22 @@ $stderrLog = Join-Path $LogDir "gelegram_stderr.log"
 & $NssmExe set $ServiceName AppStopMethodConsole 10000
 & $NssmExe set $ServiceName AppStopMethodWindow 10000
 & $NssmExe set $ServiceName AppStopMethodThreads 10000
+
+# ── Inject correct env vars via NSSM AppEnvironmentExtra ─────────────────
+# AppEnvironmentExtra adds variables to the service's env block at SCM start
+# time, BEFORE the service process is created.  For MSA (Microsoft account)
+# users the SCM may not load the user's registry hive, resulting in a broken
+# USERPROFILE / APPDATA / HOME.  Setting them here is the earliest fix point.
+$RealAppData     = Join-Path $RealUserProfile "AppData\Roaming"
+$RealLocalAppData = Join-Path $RealUserProfile "AppData\Local"
+
+& $NssmExe set $ServiceName AppEnvironmentExtra `
+    "USERPROFILE=$RealUserProfile" `
+    "HOME=$RealUserProfile" `
+    "APPDATA=$RealAppData" `
+    "LOCALAPPDATA=$RealLocalAppData"
+
+Write-Ok "Environment fix injected (USERPROFILE=$RealUserProfile)."
 
 Write-Ok "Service configured."
 

@@ -447,8 +447,78 @@ class GeminiACPClient:
           directly – they need `cmd /c <file>` to be interpreted by the shell.
         • We capture stderr separately so stray diagnostic text from
           gemini-cli cannot corrupt the JSON-RPC stream on stdout.
+
+        MSA (Microsoft Account / email sign-in) FIX:
+        • When the Windows service runs under a Microsoft-account user,
+          the service token may carry a broken or missing USERPROFILE /
+          APPDATA environment, causing gemini-cli to fail locating
+          ~/.gemini credentials and throwing a login error.
+        • We build an explicit env dict that inherits the current env but
+          overrides HOME / USERPROFILE / APPDATA with the real values so
+          gemini-cli always finds its credential files.
         """
         cli = GEMINI_CLI_PATH
+
+        # ── Build corrected environment for the gemini subprocess ────────────
+        # Inherit the full current environment first, then patch the broken
+        # profile variables that are commonly wrong in MSA service contexts.
+        subprocess_env = dict(os.environ)
+
+        if sys.platform == "win32":
+            # Detect the real user profile path.
+            # Priority: USERPROFILE env > registry ProfileList > fallback.
+            real_profile = subprocess_env.get("USERPROFILE", "")
+
+            # System / LocalSystem paths are NOT a valid user profile.
+            # When we see one, try to resolve the correct path.
+            _system_profiles = {
+                r"C:\Windows\system32\config\systemprofile",
+                r"C:\Windows\SysWOW64\config\systemprofile",
+                r"C:\Windows\ServiceProfiles\LocalService",
+                r"C:\Windows\ServiceProfiles\NetworkService",
+            }
+            if not real_profile or real_profile in _system_profiles:
+                # Attempt 1: read from service_userprofile.txt written by
+                # install_service.ps1 at install time.
+                profile_hint_file = Path(__file__).resolve().parent / "service_userprofile.txt"
+                if profile_hint_file.exists():
+                    try:
+                        real_profile = profile_hint_file.read_text(encoding="utf-8").strip()
+                        logger.info(
+                            "MSA fix: loaded USERPROFILE from service_userprofile.txt: %s",
+                            real_profile,
+                        )
+                    except Exception as e:
+                        logger.warning("MSA fix: could not read service_userprofile.txt: %s", e)
+
+            if not real_profile or real_profile in _system_profiles:
+                # Attempt 2: derive from USERNAME env var (works for local accounts)
+                username = subprocess_env.get("USERNAME", "")
+                if username and username.lower() not in ("system", "local service", "network service"):
+                    candidate = rf"C:\Users\{username}"
+                    if Path(candidate).is_dir():
+                        real_profile = candidate
+                        logger.info(
+                            "MSA fix: derived USERPROFILE from USERNAME: %s", real_profile
+                        )
+
+            if real_profile and real_profile not in _system_profiles:
+                # Patch all profile-derived env vars so gemini-cli finds ~/.gemini
+                subprocess_env["USERPROFILE"] = real_profile
+                subprocess_env["HOME"]        = real_profile   # used by Node.js / git
+                subprocess_env["APPDATA"]     = str(Path(real_profile) / "AppData" / "Roaming")
+                subprocess_env["LOCALAPPDATA"] = str(Path(real_profile) / "AppData" / "Local")
+                logger.info(
+                    "MSA fix: set USERPROFILE=%s  APPDATA=%s",
+                    subprocess_env["USERPROFILE"],
+                    subprocess_env["APPDATA"],
+                )
+            else:
+                logger.warning(
+                    "MSA fix: could not determine real USERPROFILE "
+                    "(current value=%r) – gemini auth may fail.",
+                    real_profile,
+                )
 
         # Windows: .cmd and .bat scripts require the cmd.exe interpreter.
         # asyncio.create_subprocess_exec bypasses the shell, so we must
@@ -471,6 +541,7 @@ class GeminiACPClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,   # capture stderr separately
             cwd=GEMINI_WORKING_DIR,
+            env=subprocess_env,               # explicitly corrected environment
         )
         logger.info("ACP subprocess started (pid=%s)", self._process.pid)
 

@@ -27,6 +27,9 @@ trusted_users.json
 # ── Service / Gateway artifacts ───────────────────────────────────────
 tools/
 logs/
+# Written by install_service.ps1 — contains the real USERPROFILE path for the
+# MSA (Microsoft account) env fix; machine-specific, must not be committed.
+service_userprofile.txt
 
 # ── Default agentic workspace ──────────────────────────────────────────
 workdir/
