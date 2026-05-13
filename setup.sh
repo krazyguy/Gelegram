@@ -311,6 +311,25 @@ if [[ "$INSTALL_SERVICE" =~ ^[Yy]$ ]] || [ "$INSTALL_SERVICE" = "Y" ]; then
 
     if [ "$PLATFORM" = "linux" ]; then
         # -- systemd user service ------------------------------------------------
+        write_notice "Checking systemd user session context..."
+
+        # Self-heal systemd user session variables if missing (common in headless SSH or su)
+        if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            if [ ! -d "$XDG_RUNTIME_DIR" ]; then
+                # Fallback if the typical system runtime dir isn't initialized
+                export XDG_RUNTIME_DIR="/tmp/user-$(id -u)-runtime"
+                mkdir -p "$XDG_RUNTIME_DIR"
+                chmod 700 "$XDG_RUNTIME_DIR"
+            fi
+            write_notice "Self-healed XDG_RUNTIME_DIR to: $XDG_RUNTIME_DIR"
+        fi
+
+        # Try to infer local D-Bus address if runtime bus socket exists
+        if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+        fi
+
         write_notice "Creating systemd user service..."
 
         SYSTEMD_DIR="$HOME/.config/systemd/user"
@@ -334,6 +353,7 @@ StandardOutput=append:$SCRIPT_DIR/gateway.log
 StandardError=append:$SCRIPT_DIR/gateway.log
 Environment=HOME=$HOME
 Environment=USER=$CURRENT_USER
+Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 
 [Install]
 WantedBy=default.target
@@ -341,20 +361,26 @@ EOF
 
         write_ok "Service file created: $SERVICE_FILE"
 
-        # Enable and start
-        systemctl --user daemon-reload
-        systemctl --user enable gelegram.service
-        systemctl --user start gelegram.service
+        # Test connection to systemd user manager before running command
+        # to avoid crashing under 'set -e' if D-Bus is genuinely inaccessible.
+        if systemctl --user daemon-reload >/dev/null 2>&1; then
+            systemctl --user enable gelegram.service >/dev/null 2>&1 || true
+            systemctl --user start gelegram.service >/dev/null 2>&1 || true
 
-        # Enable lingering so service survives logout
-        if command -v loginctl &>/dev/null; then
-            loginctl enable-linger "$CURRENT_USER" 2>/dev/null || true
+            # Enable lingering so service survives logout
+            if command -v loginctl &>/dev/null; then
+                loginctl enable-linger "$CURRENT_USER" >/dev/null 2>&1 || true
+            fi
+
+            write_ok "Service enabled and started."
+            write_notice "Check status with:  systemctl --user status gelegram"
+            write_notice "View logs with:     journalctl --user -u gelegram -f"
+            write_notice "Stop with:          systemctl --user stop gelegram"
+        else
+            write_err "Could not connect to systemd user manager."
+            write_notice "Please run 'systemctl --user daemon-reload' manually."
+            write_notice "Skipping automatic service startup. Moving on to Gemini Auth..."
         fi
-
-        write_ok "Service enabled and started."
-        write_notice "Check status with:  systemctl --user status gelegram"
-        write_notice "View logs with:     journalctl --user -u gelegram -f"
-        write_notice "Stop with:          systemctl --user stop gelegram"
 
     elif [ "$PLATFORM" = "macos" ]; then
         # -- launchd LaunchAgent -------------------------------------------------
