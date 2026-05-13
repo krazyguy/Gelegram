@@ -1,5 +1,5 @@
 # =============================================================================
-#  Gelegram – Onboarding Setup Script
+#  Gelegram - Onboarding Setup Script
 # =============================================================================
 #  This script automates the full installation pipeline for Gelegram:
 #    1. Checks/installs Node.js (via winget, or MSI fallback)
@@ -13,20 +13,20 @@
 #  Usage:
 #    powershell -ExecutionPolicy Bypass -File setup.ps1
 #
-#  The script is idempotent — safe to re-run. Already-completed steps are
+#  The script is idempotent -- safe to re-run. Already-completed steps are
 #  skipped with a green [OK] message.
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Resolve project root from the script's own location
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper Functions – consistent with install_service.ps1 colour scheme
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Helper Functions -- consistent with install_service.ps1 colour scheme
+# -----------------------------------------------------------------------------
 
 function Write-Step {
     param([string]$Message)
@@ -55,19 +55,19 @@ function Write-Info {
     Write-Host "    $Message" -ForegroundColor White
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Utility: Refresh PATH from registry so newly installed tools are visible
 # in the current session without restarting the terminal.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Refresh-Path {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $userPath    = [Environment]::GetEnvironmentVariable("Path", "User")
     $env:Path = "$machinePath;$userPath"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Utility: Test if a command exists on the current PATH
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Test-Command {
     param([string]$Name)
     try {
@@ -84,7 +84,7 @@ function Test-Command {
 
 Write-Host ""
 Write-Host "  ========================================================" -ForegroundColor Magenta
-Write-Host "    Gelegram – Onboarding Setup" -ForegroundColor White
+Write-Host "    Gelegram - Onboarding Setup" -ForegroundColor White
 Write-Host "  ========================================================" -ForegroundColor Magenta
 Write-Host ""
 
@@ -106,14 +106,14 @@ Write-Info "Project    : $ScriptDir"
 if (Test-Path $GeminiDir) {
     Write-Ok ".gemini directory found: $GeminiDir"
 } else {
-    Write-Notice ".gemini directory not found — will be created during gemini auth"
+    Write-Notice ".gemini directory not found -- will be created during gemini auth"
 }
 
 # =============================================================================
 #  PHASE 2: Dependency Installation
 # =============================================================================
 
-# ── 2.1  Node.js ─────────────────────────────────────────────────────────────
+# -- 2.1  Node.js --------------------------------------------------------------
 
 Write-Step "Checking Node.js"
 
@@ -126,7 +126,7 @@ if (Test-Command "node") {
     $wingetAvailable = Test-Command "winget"
 
     if ($wingetAvailable) {
-        # ── winget is available — use it directly ────────────────────────
+        # -- winget is available -- use it directly
         Write-Notice "Installing Node.js LTS via winget..."
         try {
             & winget install OpenJS.NodeJS.LTS --silent --accept-source-agreements --accept-package-agreements
@@ -142,12 +142,12 @@ if (Test-Command "node") {
         } catch {
             Write-Err "winget install failed: $_"
             Write-Notice "Falling back to MSI download..."
-            $wingetAvailable = $false  # trigger MSI fallback below
+            $wingetAvailable = $false
         }
     }
 
     if (-not $wingetAvailable) {
-        # ── winget not available — ask user ──────────────────────────────
+        # -- winget not available -- ask user
         Write-Notice "winget is not available on this system."
         $installWinget = Read-Host "    Install winget first? (Y/n)"
 
@@ -179,7 +179,7 @@ if (Test-Command "node") {
             }
         }
 
-        # ── MSI fallback (if winget didn't work or user declined) ────────
+        # -- MSI fallback (if winget didn't work or user declined)
         if (-not (Test-Command "node")) {
             Write-Notice "Downloading Node.js LTS installer from nodejs.org..."
             $nodeUrl = "https://nodejs.org/dist/v22.15.0/node-v22.15.0-x64.msi"
@@ -210,7 +210,7 @@ if (Test-Command "node") {
     }
 }
 
-# ── 2.2  uv ──────────────────────────────────────────────────────────────────
+# -- 2.2  uv -------------------------------------------------------------------
 
 Write-Step "Checking uv (Python package manager)"
 
@@ -228,14 +228,20 @@ if (Test-Command "uv") {
             $uvVersion = & uv --version 2>$null
             Write-Ok "uv installed successfully: $uvVersion"
         } else {
-            # uv installs to ~/.local/bin or CARGO_HOME — add common location
+            # uv installs to ~/.local/bin or CARGO_HOME -- add common location
             $uvLocalBin = Join-Path $UserProfile ".local\bin"
             if (Test-Path (Join-Path $uvLocalBin "uv.exe")) {
                 $env:Path = "$uvLocalBin;$env:Path"
                 Write-Ok "uv installed at $uvLocalBin"
             } else {
-                Write-Err "uv was installed but not found on PATH."
-                Write-Notice "You may need to restart your terminal."
+                $uvCargoBin = Join-Path $UserProfile ".cargo\bin"
+                if (Test-Path (Join-Path $uvCargoBin "uv.exe")) {
+                    $env:Path = "$uvCargoBin;$env:Path"
+                    Write-Ok "uv installed at $uvCargoBin"
+                } else {
+                    Write-Err "uv was installed but not found on PATH."
+                    Write-Notice "You may need to restart your terminal."
+                }
             }
         }
     } catch {
@@ -246,7 +252,7 @@ if (Test-Command "uv") {
     }
 }
 
-# ── 2.3  Gemini CLI ──────────────────────────────────────────────────────────
+# -- 2.3  Gemini CLI ------------------------------------------------------------
 
 Write-Step "Checking Gemini CLI"
 
@@ -304,7 +310,7 @@ if (Test-Path $VenvPython) {
     }
 }
 
-# ── Install Python dependencies ──────────────────────────────────────────────
+# -- Install Python dependencies -----------------------------------------------
 
 Write-Step "Installing Python dependencies"
 
@@ -350,7 +356,7 @@ if (Test-Path $EnvFile) {
     # Read the template
     $envContent = Get-Content $EnvExample -Raw
 
-    # ── Prompt: Telegram Bot Token ───────────────────────────────────────
+    # -- Prompt: Telegram Bot Token
     Write-Host ""
     Write-Host "    Please provide the following configuration values." -ForegroundColor White
     Write-Host "    (Get a bot token from @BotFather on Telegram)" -ForegroundColor DarkGray
@@ -360,16 +366,16 @@ if (Test-Path $EnvFile) {
     if ($botToken) {
         $envContent = $envContent -replace "TELEGRAM_BOT_TOKEN=.*", "TELEGRAM_BOT_TOKEN=$botToken"
     } else {
-        Write-Notice "No token entered — you'll need to edit .env manually."
+        Write-Notice "No token entered -- you will need to edit .env manually."
     }
 
-    # ── Prompt: Bot Password ─────────────────────────────────────────────
+    # -- Prompt: Bot Password
     $botPassword = Read-Host "    Set a Telegram password (or press Enter to skip)"
     if ($botPassword) {
         $envContent = $envContent -replace "BOT_PASSWORD=.*", "BOT_PASSWORD=$botPassword"
     }
 
-    # ── Prompt: Workspace Location ───────────────────────────────────────
+    # -- Prompt: Workspace Location
     $defaultWorkspace = ".\workdir"
     $workspace = Read-Host "    Workspace directory (default: $defaultWorkspace)"
     if (-not $workspace) {
@@ -377,7 +383,7 @@ if (Test-Path $EnvFile) {
     }
     $envContent = $envContent -replace "GEMINI_WORKING_DIR=.*", "GEMINI_WORKING_DIR=$workspace"
 
-    # ── Detect Gemini CLI Path ───────────────────────────────────────────
+    # -- Detect Gemini CLI Path
     # Try where.exe first (works if gemini was already on PATH before this session).
     # Fall back to the standard npm global install location on Windows.
     $geminiCliPath = $null
@@ -405,7 +411,7 @@ if (Test-Path $EnvFile) {
 
     $envContent = $envContent -replace "GEMINI_CLI_PATH=.*", "GEMINI_CLI_PATH=$geminiCliPath"
 
-    # ── Write the .env file ──────────────────────────────────────────────
+    # -- Write the .env file
     $envContent | Set-Content -Path $EnvFile -Encoding UTF8 -NoNewline
     Write-Ok ".env file created successfully."
 }
@@ -418,7 +424,7 @@ Write-Step "Gemini CLI Authentication"
 
 Write-Host ""
 Write-Host "    Gemini CLI needs Google OAuth to function." -ForegroundColor White
-Write-Host "    A browser window will open — log in with your Google account." -ForegroundColor White
+Write-Host "    A browser window will open -- log in with your Google account." -ForegroundColor White
 Write-Host "    Close the gemini session after authentication completes." -ForegroundColor DarkGray
 Write-Host ""
 
@@ -441,8 +447,8 @@ if (-not $geminiAuthCmd) {
 if ($geminiAuthCmd) {
     try {
         Write-Notice "Running: gemini auth"
-        # Run gemini auth — this opens a browser for Google OAuth
-        & cmd /c "$geminiAuthCmd" auth
+        # Run gemini auth -- this opens a browser for Google OAuth
+        & cmd /c "`"$geminiAuthCmd`"" auth
         Write-Ok "Gemini authentication completed."
     } catch {
         Write-Notice "gemini auth exited (this may be normal): $_"
@@ -514,7 +520,7 @@ Write-Host "  .gemini      : $GeminiDir" -ForegroundColor White
 Write-Host ""
 Write-Host "  IMPORTANT REMINDERS:" -ForegroundColor Yellow
 Write-Host "    1. If gemini auth didn't complete, run: gemini auth" -ForegroundColor Yellow
-Write-Host "    2. Message your bot on Telegram — it will guide you" -ForegroundColor Yellow
+Write-Host "    2. Message your bot on Telegram -- it will guide you" -ForegroundColor Yellow
 Write-Host "       through identity setup on the first message." -ForegroundColor Yellow
 Write-Host ""
 
