@@ -175,8 +175,11 @@ def _kill_orphan_bots() -> None:
 
 def _validate_environment():
     """
-    Pre-flight checks: ensure the venv Python and bot.py exist.
-    Exits with a clear error message if anything is missing.
+    Pre-flight checks: ensure the venv Python, bot.py, and Gemini CLI exist.
+    Exits with a clear error message if venv or bot.py are missing.
+    Warns (but does not exit) if the Gemini CLI path cannot be verified —
+    bot.py will surface a clearer error when it actually tries to spawn the
+    subprocess.
     """
     if not VENV_PYTHON.exists():
         logger.critical(
@@ -190,6 +193,57 @@ def _validate_environment():
     if not BOT_SCRIPT.exists():
         logger.critical("Bot script not found at: %s", BOT_SCRIPT)
         sys.exit(1)
+
+    # ── Gemini CLI path validation ────────────────────────────────────────────
+    # Read GEMINI_CLI_PATH from .env (same as bot.py does) and verify it exists.
+    # This catches misconfigurations early with a clear warning instead of a
+    # cryptic ACP JSON-RPC error later when bot.py tries to spawn the subprocess.
+    from dotenv import load_dotenv
+    load_dotenv(SCRIPT_DIR / ".env")
+    gemini_cli_path = os.environ.get("GEMINI_CLI_PATH", "gemini")
+
+    gemini_found = False
+
+    # Strategy 1: Check if the configured path is an existing file
+    if Path(gemini_cli_path).exists():
+        gemini_found = True
+        logger.info("Gemini CLI verified: %s", gemini_cli_path)
+
+    # Strategy 2: Try where.exe (works if gemini is on PATH)
+    if not gemini_found:
+        try:
+            result = subprocess.run(
+                ["where.exe", gemini_cli_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                resolved = result.stdout.strip().splitlines()[0]
+                gemini_found = True
+                logger.info("Gemini CLI found via where: %s", resolved)
+        except Exception:
+            pass
+
+    # Strategy 3: Fallback to standard npm global install path on Windows
+    if not gemini_found and sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            default_path = Path(appdata) / "npm" / "gemini.cmd"
+            if default_path.exists():
+                gemini_found = True
+                logger.info("Gemini CLI found at default npm path: %s", default_path)
+                logger.info(
+                    "Consider setting GEMINI_CLI_PATH=%s in .env for reliability.",
+                    default_path,
+                )
+
+    if not gemini_found:
+        logger.warning(
+            "Gemini CLI could not be found (GEMINI_CLI_PATH=%s). "
+            "The bot will fail to start ACP sessions until this is resolved.\n"
+            "  → Install: npm install -g @google/gemini-cli\n"
+            "  → Or set GEMINI_CLI_PATH in .env to the full path of gemini.cmd",
+            gemini_cli_path,
+        )
 
 
 def _run_bot() -> int:

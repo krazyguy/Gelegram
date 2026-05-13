@@ -33,8 +33,10 @@ uv pip install -r requirements.txt
 Copy-Item .env.example .env
 # Edit .env — paste your TELEGRAM_BOT_TOKEN at minimum
 
-# 4. Run
-python bot.py
+# 4. Run (or install as background service)
+python bot.py               # Runs in foreground
+# OR
+.\install_service.ps1       # Installs as 24/7 Windows service
 ```
 
 **That's it.** Message your bot on Telegram — on the **first message**, the agent will introduce itself and walk you through setting up its identity (name, personality, rules). After that it's yours. 🎉
