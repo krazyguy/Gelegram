@@ -50,7 +50,15 @@ except ImportError:
 # Resolve absolute paths so the script works from any CWD (important for services)
 SCRIPT_DIR = Path(__file__).resolve().parent
 BOT_SCRIPT = SCRIPT_DIR / "bot.py"
-VENV_PYTHON = SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+
+# Cross-platform venv Python path:
+#   Windows : .venv\Scripts\python.exe
+#   Linux / macOS : .venv/bin/python
+if sys.platform == "win32":
+    VENV_PYTHON = SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+else:
+    VENV_PYTHON = SCRIPT_DIR / ".venv" / "bin" / "python"
+
 BOT_PID_FILE = SCRIPT_DIR / "bot.pid"   # tracks the current bot.py PID across restarts
 
 # Restart backoff settings

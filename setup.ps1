@@ -7,8 +7,8 @@
 #    3. Checks/installs Gemini CLI (npm global)
 #    4. Creates Python venv and installs dependencies
 #    5. Configures .env (bot token, password, workspace path, gemini CLI path)
-#    6. Runs gemini auth for Google OAuth
-#    7. Optionally installs the Windows service (default: Yes)
+#    6. Optionally installs the Windows service (default: Yes)
+#    7. Runs gemini auth for Google OAuth (final step)
 #
 #  Usage:
 #    powershell -ExecutionPolicy Bypass -File setup.ps1
@@ -417,7 +417,48 @@ if (Test-Path $EnvFile) {
 }
 
 # =============================================================================
-#  PHASE 5: Gemini Auth
+#  PHASE 5: Service Installation
+# =============================================================================
+
+Write-Step "Windows Service Installation"
+
+Write-Host ""
+Write-Host "    Install Gelegram as a Windows background service?" -ForegroundColor White
+Write-Host "    This makes the bot start automatically on boot and" -ForegroundColor White
+Write-Host "    survive crashes with automatic restarts." -ForegroundColor White
+Write-Host ""
+
+$installService = Read-Host "    Install as service? [Y/n] (default: Y)"
+
+if ($installService -eq "" -or $installService -match "^[Yy]") {
+    Write-Notice "Launching service installer (will request Administrator elevation)..."
+    $installScript = Join-Path $ScriptDir "install_service.ps1"
+
+    if (Test-Path $installScript) {
+        try {
+            & powershell -ExecutionPolicy Bypass -File "$installScript"
+        } catch {
+            Write-Err "Service installation failed: $_"
+            Write-Notice "You can run install_service.ps1 manually later."
+        }
+    } else {
+        Write-Err "install_service.ps1 not found at: $installScript"
+    }
+} else {
+    Write-Ok "Skipping service installation."
+    Write-Host ""
+    Write-Host "    To run the bot manually:" -ForegroundColor White
+    Write-Host "      .venv\Scripts\activate" -ForegroundColor DarkGray
+    Write-Host "      python gateway.py            # with watchdog (recommended)" -ForegroundColor DarkGray
+    Write-Host "      python bot.py                # without watchdog" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "    To install as a service later:" -ForegroundColor White
+    Write-Host "      powershell -File install_service.ps1" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+# =============================================================================
+#  PHASE 6: Gemini Auth (final step)
 # =============================================================================
 
 Write-Step "Gemini CLI Authentication"
@@ -464,47 +505,6 @@ Write-Host "    If the browser didn't open, run 'gemini auth' manually." -Foregr
 Write-Host ""
 
 # =============================================================================
-#  PHASE 6: Service Installation
-# =============================================================================
-
-Write-Step "Windows Service Installation"
-
-Write-Host ""
-Write-Host "    Install Gelegram as a Windows background service?" -ForegroundColor White
-Write-Host "    This makes the bot start automatically on boot and" -ForegroundColor White
-Write-Host "    survive crashes with automatic restarts." -ForegroundColor White
-Write-Host ""
-
-$installService = Read-Host "    Install as service? [Y/n] (default: Y)"
-
-if ($installService -eq "" -or $installService -match "^[Yy]") {
-    Write-Notice "Launching service installer (will request Administrator elevation)..."
-    $installScript = Join-Path $ScriptDir "install_service.ps1"
-
-    if (Test-Path $installScript) {
-        try {
-            & powershell -ExecutionPolicy Bypass -File "$installScript"
-        } catch {
-            Write-Err "Service installation failed: $_"
-            Write-Notice "You can run install_service.ps1 manually later."
-        }
-    } else {
-        Write-Err "install_service.ps1 not found at: $installScript"
-    }
-} else {
-    Write-Ok "Skipping service installation."
-    Write-Host ""
-    Write-Host "    To run the bot manually:" -ForegroundColor White
-    Write-Host "      .venv\Scripts\activate" -ForegroundColor DarkGray
-    Write-Host "      python gateway.py            # with watchdog (recommended)" -ForegroundColor DarkGray
-    Write-Host "      python bot.py                # without watchdog" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "    To install as a service later:" -ForegroundColor White
-    Write-Host "      powershell -File install_service.ps1" -ForegroundColor DarkGray
-    Write-Host ""
-}
-
-# =============================================================================
 #  SUMMARY
 # =============================================================================
 
@@ -525,3 +525,4 @@ Write-Host "       through identity setup on the first message." -ForegroundColo
 Write-Host ""
 
 Read-Host "Press Enter to close"
+

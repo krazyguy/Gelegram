@@ -1,13 +1,15 @@
 # Gelegram 🤖
 
-> **Your personal AI agent — accessible from Telegram, powered by Gemini. It knows who you are, remembers what matters, learns new skills, and keeps running 24/7 as a Windows service.**
+> **Your personal AI agent — accessible from Telegram, powered by Gemini. It knows who you are, remembers what matters, learns new skills, and keeps running 24/7.**
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://python.org)
 [![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-required-4285F4?logo=google)](https://github.com/google-gemini/gemini-cli)
-[![Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows)](https://microsoft.com/windows)
+[![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows)](https://microsoft.com/windows)
+[![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://kernel.org)
+[![macOS](https://img.shields.io/badge/macOS-000000?logo=apple)](https://apple.com/macos)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Gelegram is a **lightweight, self-hosted AI agent** built on the Gemini CLI. Think of it as your own pocket **OpenClaw** — an agent with a **persistent identity**, **long and short-term memory**, and a **pluggable skills system** — all accessible from your phone via Telegram.
+Gelegram is a **lightweight, self-hosted AI agent** built on the Gemini CLI. Think of it as your own pocket assistant — an agent with a **persistent identity**, **long and short-term memory**, and a **pluggable skills system** — all accessible from your phone via Telegram.
 
 You define who the agent is on first run. It remembers your preferences, your projects, your history. You can extend it with custom skills, and it can read/write files, run scripts, and search the web. Throw files at it, ask it complex tasks, and it'll send results straight back to your chat.
 
@@ -15,29 +17,32 @@ You define who the agent is on first run. It remembers your preferences, your pr
 
 ## 🚀 Quick Start
 
-> **Prerequisites:** [Node.js 18+](https://nodejs.org) · [Python 3.11+](https://python.org) · [uv](https://github.com/astral-sh/uv) · A Telegram bot token from [@BotFather](https://t.me/BotFather)
+> **Only prerequisite:** [Python 3.11+](https://python.org) and a Telegram bot token from [@BotFather](https://t.me/BotFather). The setup script installs everything else automatically.
+
+### Windows
 
 ```powershell
-# 1. Install Gemini CLI and authenticate (one-time)
-npm install -g @google/gemini-cli
-gemini   # completes Google OAuth — close it after login
-
-# 2. Clone and set up the project
 git clone https://github.com/krazyguy/Gelegram.git
 cd Gelegram
-uv venv .venv
-.venv\Scripts\activate
-uv pip install -r requirements.txt
-
-# 3. Configure
-Copy-Item .env.example .env
-# Edit .env — paste your TELEGRAM_BOT_TOKEN at minimum
-
-# 4. Run (or install as background service)
-python bot.py               # Runs in foreground
-# OR
-.\install_service.ps1       # Installs as 24/7 Windows service
+powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
+
+### Linux / macOS
+
+```bash
+git clone https://github.com/krazyguy/Gelegram.git
+cd Gelegram
+chmod +x setup.sh && ./setup.sh
+```
+
+The setup script will:
+1. ✅ Install **Node.js** (winget / brew / apt / nvm as appropriate)
+2. ✅ Install **uv** (Python package manager)
+3. ✅ Install **Gemini CLI** via npm
+4. ✅ Create Python **virtual environment** and install dependencies
+5. ✅ Generate your **`.env`** file (prompts for bot token, password, workspace)
+6. ✅ Optionally install as a **background service** (NSSM on Windows, systemd on Linux, launchd on macOS)
+7. ✅ Run **`gemini auth`** for Google OAuth
 
 **That's it.** Message your bot on Telegram — on the **first message**, the agent will introduce itself and walk you through setting up its identity (name, personality, rules). After that it's yours. 🎉
 
@@ -59,21 +64,22 @@ python bot.py               # Runs in foreground
 | 🕵️ **Private mode** | Toggle transcript logging per session with `/private` |
 | ⚡ **Auto-tool approval** | File edits, shell commands, web search — all auto-approved |
 | 🛑 **Task cancellation** | `/kill` stops a long-running task without resetting the session |
-| 🖥️ **Windows service** | Run 24/7 via NSSM — auto-starts on boot, survives crashes |
+| 🖥️ **Cross-platform service** | Windows (NSSM), Linux (systemd), macOS (launchd) — all via one setup script |
 | 🔄 **Watchdog gateway** | Exponential backoff restart if the agent process crashes |
+| 🔍 **Startup CLI validation** | Gateway checks Gemini CLI path on start, warns early if misconfigured |
 
 ---
 
 ## Table of Contents
 
 - [How It Works](#how-it-works)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
+- [Platform Support](#platform-support)
+- [Manual Installation](#manual-installation)
 - [Configuration](#configuration)
 - [Running the Bot](#running-the-bot)
 - [Bot Commands](#bot-commands)
 - [Agentic Workspace System](#agentic-workspace-system)
-- [Windows Service (Production)](#windows-service-production)
+- [Background Service (Production)](#background-service-production)
 - [Architecture Notes](#architecture-notes)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
@@ -98,104 +104,93 @@ The ACP subprocess is **started once on the first message** and kept alive for s
 
 ---
 
-## Prerequisites
+## Platform Support
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| **Python** | 3.11+ | Tested on 3.12 / 3.13 |
-| **uv** | latest | Recommended package manager |
-| **Node.js** | 18+ | Required to run gemini-cli |
-| **Gemini CLI** | latest | `npm install -g @google/gemini-cli` |
-| **Telegram Bot Token** | — | Create one via [@BotFather](https://t.me/BotFather) |
-| **Google Account** | — | Used by gemini-cli for authentication (OAuth) |
+Gelegram runs on **Windows, Linux, and macOS**. The core bot (`bot.py` + `gateway.py`) is pure Python and works identically across all platforms. The only platform-specific component is the background service mechanism.
 
-> **Gemini CLI is the core AI engine.** It must be installed, authenticated, and accessible from your PATH before running Gelegram.
+| Platform | Setup Script | Service Manager | Node.js Install |
+|----------|-------------|-----------------|-----------------|
+| **Windows** | `setup.ps1` | NSSM (auto-downloaded) | winget → MSI fallback |
+| **Linux** | `setup.sh` | systemd user service | nvm → apt/dnf/pacman |
+| **macOS** | `setup.sh` | launchd LaunchAgent | nvm → Homebrew |
 
-### Install Gemini CLI
+> **Note (Windows):** After installing via npm, the Gemini CLI binary is at `%APPDATA%\npm\gemini.cmd`. The setup script detects this automatically and writes it to `.env`.
 
-```powershell
-npm install -g @google/gemini-cli
-
-# Verify installation
-gemini --version
-```
-
-**Authenticate once** by running Gemini interactively — this caches OAuth credentials that Gelegram will reuse:
-
-```powershell
-gemini
-```
-
-> **Important (Windows):** After installing via npm, the binary is usually at `%APPDATA%\npm\gemini.cmd`. If `gemini` is not on your PATH, find its full path with `where gemini` in PowerShell and use it in `.env`.
+> **Note (Linux/macOS):** The systemd service uses `loginctl enable-linger` so the bot keeps running after you log out of SSH.
 
 ---
 
-## Installation
+## Manual Installation
 
-### 1. Clone the Repository
+If you prefer to set up manually instead of using the setup script:
 
-```powershell
+### 1. Install Prerequisites
+
+```bash
+# Install Node.js 18+ from https://nodejs.org
+# Install uv from https://github.com/astral-sh/uv
+
+# Install Gemini CLI
+npm install -g @google/gemini-cli
+
+# Authenticate (opens browser for Google OAuth — do this once)
+gemini auth
+```
+
+### 2. Clone and Set Up
+
+```bash
 git clone https://github.com/krazyguy/gelegram.git
 cd gelegram
-```
 
-### 2. Create a Virtual Environment
-
-```powershell
-# Using uv (recommended)
+# Create virtual environment
 uv venv .venv
-.venv\Scripts\activate
 
-# Or using standard venv
-python -m venv .venv
-.venv\Scripts\activate
+# Install dependencies
+uv pip install -r requirements.txt
 ```
 
-### 3. Install Dependencies
+### 3. Configure
 
-```powershell
-uv pip install -r requirements.txt
+```bash
+# Windows
+Copy-Item .env.example .env
 
-# Or with pip
-pip install -r requirements.txt
+# Linux / macOS
+cp .env.example .env
+
+# Edit .env and add your TELEGRAM_BOT_TOKEN at minimum
 ```
 
 ---
 
 ## Configuration
 
-### 1. Create Your `.env` File
-
-```powershell
-Copy-Item .env.example .env
-```
-
-### 2. Edit `.env`
+### `.env` Reference
 
 ```ini
-# ── Required ──────────────────────────────────────────────────────────
+# -- Required ------------------------------------------------------------------
 # Your Telegram Bot Token from @BotFather
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxyz
 
-# ── Optional ──────────────────────────────────────────────────────────
+# -- Optional ------------------------------------------------------------------
 
-# Full path to the gemini executable (default: "gemini" — uses PATH)
+# Full path to the gemini executable (default: "gemini" -- uses PATH)
 # Windows: usually at C:\Users\<you>\AppData\Roaming\npm\gemini.cmd
-# Run: where gemini   to find the path
+# Run: where gemini  (Windows) or  which gemini  (Linux/macOS)
 GEMINI_CLI_PATH=gemini
 
 # Working directory for the gemini-cli subprocess.
 # Gemini will read/write files here. The agentic workspace is scaffolded here.
-# Use an absolute path, e.g. D:\my-agent-workspace
-GEMINI_WORKING_DIR=.\workdir
+# Use an absolute path for reliability.
+GEMINI_WORKING_DIR=./workdir
 
 # Maximum seconds to wait for a Gemini response (default: 120)
-# Increase for complex/long-running tasks. After ACP_TIMEOUT, the user is
-# notified and the bot waits up to 30 minutes before giving up.
+# After ACP_TIMEOUT, the user is notified and the bot waits up to 30 minutes.
 ACP_TIMEOUT=120
 
-# Optional: restrict the bot to users who know this password.
-# Leave empty (or omit) to allow all users.
+# Optional bot password. Users must send this before the bot accepts messages.
+# Leave empty to allow all users.
 BOT_PASSWORD=
 ```
 
@@ -205,34 +200,31 @@ BOT_PASSWORD=
 
 ### Development (foreground)
 
-```powershell
-# Activate the virtual environment
+```bash
+# Windows
 .venv\Scripts\activate
+python bot.py
 
-# Start the bot
+# Linux / macOS
+source .venv/bin/activate
 python bot.py
 ```
 
-Expected output:
-```
-2026-05-10 12:00:00 | INFO     | gelegram | ============================================================
-2026-05-10 12:00:00 | INFO     | gelegram |   Gelegram - Telegram -> Gemini CLI ACP Bridge
-2026-05-10 12:00:00 | INFO     | gelegram | ============================================================
-2026-05-10 12:00:00 | INFO     | gelegram | Bot is polling for updates … (Ctrl+C to stop)
-```
+### With Gateway Watchdog (recommended)
 
-On the **first message**, the bot will:
-1. Start the `gemini --acp` subprocess.
-2. Perform the JSON-RPC handshake (`initialize` → `session/new`).
-3. Forward your message and return the streaming response.
-
-### With the Gateway Watchdog (recommended for development)
-
-```powershell
+```bash
 python gateway.py
 ```
 
-The gateway automatically restarts `bot.py` if it crashes, with exponential backoff.
+The gateway automatically restarts `bot.py` if it crashes, with exponential backoff. It also validates the Gemini CLI path on startup and warns early if it's misconfigured.
+
+Expected output:
+```
+2026-05-13 12:00:00 | INFO     | gateway | ============================================================
+2026-05-13 12:00:00 | INFO     | gateway |   Gelegram Gateway - Watchdog Service
+2026-05-13 12:00:00 | INFO     | gateway | ============================================================
+2026-05-13 12:00:00 | INFO     | gateway | bot.py started (pid=12345)
+```
 
 ---
 
@@ -269,23 +261,23 @@ On first run with a new working directory, `workspace_init.py` creates:
 
 ```
 <GEMINI_WORKING_DIR>/
-├── GEMINI.md              ← Agent entry point & identity bootstrap instructions
-├── AGENTS.md              ← Behavioral rules and operational protocols
-├── TODO.md                ← Task tracker
-├── TOOLS.md               ← Environment-specific notes (SSH, devices, etc.)
-├── HALLUCINATIONS.md      ← Hallucination tracking policy
-├── memory/                ← Daily memory logs (YYYY-MM-DD.md)
+├── GEMINI.md              <- Agent entry point & identity bootstrap instructions
+├── AGENTS.md              <- Behavioral rules and operational protocols
+├── TODO.md                <- Task tracker
+├── TOOLS.md               <- Environment-specific notes (SSH, devices, etc.)
+├── HALLUCINATIONS.md      <- Hallucination tracking policy
+├── memory/                <- Daily memory logs (YYYY-MM-DD.md)
 ├── skills/
 │   └── memory-agent/
-│       ├── SKILL.md       ← Memory distillation skill documentation
+│       ├── SKILL.md       <- Memory distillation skill documentation
 │       └── scripts/
-│           └── distill.py ← Transcript → memory summary tool
-├── projects/              ← Project-specific work folders
-├── scripts/               ← User/agent scripts
-├── transcripts/           ← Raw session transcripts (auto-logged)
-├── media/incoming/        ← Files received from Telegram
-├── state/                 ← Persistent state (processed sessions, etc.)
-└── tmp/                   ← Scratch files
+│           └── distill.py <- Transcript -> memory summary tool
+├── projects/              <- Project-specific work folders
+├── scripts/               <- User/agent scripts
+├── transcripts/           <- Raw session transcripts (auto-logged)
+├── media/incoming/        <- Files received from Telegram
+├── state/                 <- Persistent state (processed sessions, etc.)
+└── tmp/                   <- Scratch files
 ```
 
 ### Bootstrap Mode (First Conversation)
@@ -299,42 +291,82 @@ When `SOUL.md` is missing, `GEMINI.md` triggers **Bootstrap Mode**:
 
 ### Memory Distillation
 
-The included `skills/memory-agent/scripts/distill.py` can be run to convert raw session transcripts into concise memory summaries stored in `memory/`:
+The included `skills/memory-agent/scripts/distill.py` converts raw session transcripts into concise memory summaries stored in `memory/`:
 
-```powershell
+```bash
 python <GEMINI_WORKING_DIR>/skills/memory-agent/scripts/distill.py --workspace <GEMINI_WORKING_DIR>
 ```
 
 ---
 
-## Windows Service (Production)
+## Background Service (Production)
 
-Gelegram can run as a persistent Windows background service using **NSSM** (Non-Sucking Service Manager) with a two-layer resilience architecture:
+The recommended production setup uses a two-layer resilience architecture:
 
 ```
-Windows Service (NSSM)
+OS Service Manager  (NSSM / systemd / launchd)
     └── gateway.py  (watchdog with exponential backoff)
             └── bot.py  (the actual Telegram bot)
 ```
 
-### Install as a Service
+The setup script handles service installation automatically. For manual control:
+
+### Windows (NSSM)
 
 ```powershell
-# Run as Administrator
-.\install_service.ps1
+# Install (requires Administrator)
+powershell -ExecutionPolicy Bypass -File install_service.ps1
+
+# Uninstall
+powershell -ExecutionPolicy Bypass -File uninstall_service.ps1
+
+# Status / control
+Get-Service Gelegram
+Start-Service Gelegram
+Stop-Service Gelegram
+Restart-Service Gelegram
+
+# Live log tail
+Get-Content .\logs\gelegram_stdout.log -Tail 50 -Wait
 ```
 
-The script:
-1. Downloads NSSM automatically (if not present).
-2. Creates a Windows service pointing to `gateway.py`.
-3. Configures automatic startup on boot.
-4. Sets up log rotation to `logs/`.
+### Linux (systemd)
 
-### Uninstall Service
+```bash
+# Status
+systemctl --user status gelegram
 
-```powershell
-# Run as Administrator
-.\uninstall_service.ps1
+# Control
+systemctl --user start gelegram
+systemctl --user stop gelegram
+systemctl --user restart gelegram
+
+# Live logs
+journalctl --user -u gelegram -f
+
+# Remove service
+systemctl --user disable --now gelegram
+rm ~/.config/systemd/user/gelegram.service
+systemctl --user daemon-reload
+```
+
+### macOS (launchd)
+
+```bash
+PLIST="$HOME/Library/LaunchAgents/com.gelegram.bot.plist"
+
+# Status
+launchctl list | grep gelegram
+
+# Stop / Start
+launchctl unload "$PLIST"
+launchctl load "$PLIST"
+
+# Live logs
+tail -f gateway.log
+
+# Remove service
+launchctl unload "$PLIST" && rm "$PLIST"
 ```
 
 ### Gateway Watchdog Behavior
@@ -348,6 +380,7 @@ The script:
 | **Telegram cool-down** | 5s delay after bot exit before restart (prevents getUpdates conflicts) |
 | **Orphan cleanup** | Kills leftover `bot.py` processes from previous runs (via `bot.pid` + psutil) |
 | **Graceful shutdown** | Handles SIGINT / SIGTERM / CTRL+BREAK cleanly |
+| **CLI path validation** | Checks Gemini CLI exists on startup; warns with install hint if missing |
 | **Separate logging** | All lifecycle events go to `gateway.log` |
 
 ---
@@ -360,18 +393,17 @@ The ACP server communicates via **newline-delimited JSON** on `stdin`/`stdout`:
 
 ```json
 // 1. Initialize
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"gelegram","version":"1.0.0"},"clientCapabilities":{}}}
-← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[...]}}
+-> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"gelegram","version":"1.0.0"},"clientCapabilities":{}}}
+<- {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[...]}}
 
 // 2. Create session
-→ {"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"...","mcpServers":[],"trustedFolders":["..."]}}
-← {"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-abc123"}}
+-> {"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"...","mcpServers":[],"trustedFolders":["..."]}}
+<- {"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-abc123"}}
 
 // 3. Send prompt (streaming)
-→ {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-abc123","prompt":[{"type":"text","text":"Hello!"}]}}
-← {"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}}
-← {"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" there!"}}}}
-← {"jsonrpc":"2.0","id":3,"result":{}}
+-> {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-abc123","prompt":[{"type":"text","text":"Hello!"}]}}
+<- {"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}}
+<- {"jsonrpc":"2.0","id":3,"result":{}}
 ```
 
 ### Concurrency
@@ -394,22 +426,24 @@ Telegram has a 4096-character message limit. Long responses are automatically sp
 
 ```
 gelegram/
-├── bot.py               ← Main bot: Telegram polling + GeminiACPClient
-├── gateway.py           ← Watchdog: auto-restarts bot.py with backoff
-├── workspace_init.py    ← Scaffolds agentic workspace on first run
-├── chat.py              ← (utility module)
-├── install_service.ps1  ← NSSM Windows service installer
-├── uninstall_service.ps1← NSSM Windows service uninstaller
-├── run_gateway.bat      ← Simple bat launcher for the gateway
-├── requirements.txt     ← Python dependencies
-├── .env.example         ← Configuration template (copy to .env)
-├── .env                 ← Your secrets ⚠️ never commit this!
-├── trusted_users.json   ← Authenticated chat IDs (auto-managed)
-├── bot.log              ← Bot runtime log (created on first run)
-├── gateway.log          ← Gateway lifecycle log
-├── bot.pid              ← Current bot.py PID (auto-managed)
-├── workdir/             ← Default agentic workspace (see GEMINI_WORKING_DIR)
-└── logs/                ← Service stdout/stderr logs (created by NSSM)
+├── bot.py                <- Main bot: Telegram polling + GeminiACPClient
+├── gateway.py            <- Watchdog: auto-restarts bot.py with backoff (cross-platform)
+├── workspace_init.py     <- Scaffolds agentic workspace on first run
+├── chat.py               <- (utility module)
+├── setup.ps1             <- One-command onboarding script (Windows)
+├── setup.sh              <- One-command onboarding script (Linux / macOS)
+├── install_service.ps1   <- NSSM Windows service installer
+├── uninstall_service.ps1 <- NSSM Windows service uninstaller
+├── run_gateway.bat       <- Batch launcher for the Windows service
+├── requirements.txt      <- Python dependencies
+├── .env.example          <- Configuration template (copy to .env)
+├── .env                  <- Your secrets ⚠️ never commit this!
+├── trusted_users.json    <- Authenticated chat IDs (auto-managed)
+├── bot.log               <- Bot runtime log (created on first run)
+├── gateway.log           <- Gateway lifecycle log
+├── bot.pid               <- Current bot.py PID (auto-managed)
+├── workdir/              <- Default agentic workspace (see GEMINI_WORKING_DIR)
+└── logs/                 <- Service stdout/stderr logs (created by service managers)
 ```
 
 ---
@@ -419,8 +453,8 @@ gelegram/
 | Symptom | Fix |
 |---------|-----|
 | `TELEGRAM_BOT_TOKEN is not set` | Create `.env` and add your token from @BotFather |
-| `Could not find Gemini CLI executable` | Set `GEMINI_CLI_PATH` to the full path in `.env` |
-| Bot hangs on first message | Run `gemini` interactively to complete Google OAuth |
+| `Could not find Gemini CLI executable` | Set `GEMINI_CLI_PATH` in `.env` to the full path; on Windows try `%APPDATA%\npm\gemini.cmd` |
+| Bot hangs on first message | Run `gemini auth` to complete Google OAuth |
 | `Conflict: terminated by other getUpdates` | Wait 10s and try again; the gateway handles this automatically on restart |
 | `ACP error` in logs | Check `bot.log` for the raw JSON-RPC error message |
 | Timeout after `ACP_TIMEOUT` seconds | The user is notified automatically; bot waits up to 30 min. Increase `ACP_TIMEOUT` for complex tasks |
@@ -428,6 +462,9 @@ gelegram/
 | Session not persisting after restart | This is expected — send any message and a fresh session starts automatically |
 | `EOFError: ACP subprocess closed stdout` | Gemini CLI crashed; the bot auto-restarts it on the next message |
 | Windows service not starting | Run `install_service.ps1` as Administrator; check `logs/` for NSSM output |
+| Linux service not starting | Run `journalctl --user -u gelegram -n 50` to see startup errors |
+| macOS service not starting | Run `tail -50 gateway.log`; check plist with `launchctl list \| grep gelegram` |
+| Gateway warns "Gemini CLI could not be found" | Set `GEMINI_CLI_PATH` in `.env` to the absolute path of `gemini` or `gemini.cmd` |
 
 ### Enable Debug Logging
 
@@ -435,16 +472,6 @@ To see all raw JSON-RPC messages exchanged with gemini-cli, edit `bot.py`:
 
 ```python
 logging.basicConfig(..., level=logging.DEBUG, ...)
-```
-
-### Check Service Status (PowerShell)
-
-```powershell
-# Check if the service is running
-Get-Service -Name "Gelegram"
-
-# View recent service logs
-Get-Content .\logs\gelegram_stdout.log -Tail 50
 ```
 
 ---
