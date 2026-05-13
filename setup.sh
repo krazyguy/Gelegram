@@ -307,6 +307,9 @@ echo ""
 
 INSTALL_SERVICE="$(ask "Install as service? [Y/n]" "Y")"
 
+# Track whether systemd failed so we can print instructions at the end
+SYSTEMD_FAILED=false
+
 if [[ "$INSTALL_SERVICE" =~ ^[Yy]$ ]] || [ "$INSTALL_SERVICE" = "Y" ]; then
 
     if [ "$PLATFORM" = "linux" ]; then
@@ -377,9 +380,11 @@ EOF
             write_notice "View logs with:     journalctl --user -u gelegram -f"
             write_notice "Stop with:          systemctl --user stop gelegram"
         else
+            SYSTEMD_FAILED=true
             write_err "Could not connect to systemd user manager."
-            write_notice "Please run 'systemctl --user daemon-reload' manually."
+            write_notice "The service file has been created but could not be activated."
             write_notice "Skipping automatic service startup. Moving on to Gemini Auth..."
+            write_notice "Instructions to activate the service will be shown at the end."
         fi
 
     elif [ "$PLATFORM" = "macos" ]; then
@@ -505,3 +510,32 @@ echo -e "  ${YELLOW}  1. If gemini auth didn't complete, run: gemini auth${NC}"
 echo -e "  ${YELLOW}  2. Message your bot on Telegram -- it will guide you${NC}"
 echo -e "  ${YELLOW}     through identity setup on the first message.${NC}"
 echo ""
+
+# -- Show manual service activation steps if systemd user manager was unreachable
+if [ "$SYSTEMD_FAILED" = true ]; then
+    echo -e "  ${RED}ACTION REQUIRED: Systemd service was not activated${NC}"
+    echo -e "  ${YELLOW}  The service file was created but could not be started${NC}"
+    echo -e "  ${YELLOW}  because this session has no user-level D-Bus connection.${NC}"
+    echo -e "  ${YELLOW}  This usually happens in SSH or after 'su' to another user.${NC}"
+    echo ""
+    echo -e "  ${BOLD}To activate the service, run these commands in a NEW login session:${NC}"
+    echo -e "  ${GRAY}  (Log out and SSH back in, or open a fresh terminal)${NC}"
+    echo ""
+    echo -e "    ${CYAN}# Step 1: Enable the service to start on boot${NC}"
+    echo -e "    systemctl --user enable gelegram.service"
+    echo ""
+    echo -e "    ${CYAN}# Step 2: Start the service now${NC}"
+    echo -e "    systemctl --user start gelegram.service"
+    echo ""
+    echo -e "    ${CYAN}# Step 3: Keep the service running even after you log out${NC}"
+    echo -e "    loginctl enable-linger $CURRENT_USER"
+    echo ""
+    echo -e "    ${CYAN}# Step 4: Verify it is running${NC}"
+    echo -e "    systemctl --user status gelegram"
+    echo ""
+    echo -e "  ${YELLOW}OR, to run the bot manually right now (no service):${NC}"
+    echo -e "    cd $SCRIPT_DIR"
+    echo -e "    source .venv/bin/activate"
+    echo -e "    python gateway.py"
+    echo ""
+fi
