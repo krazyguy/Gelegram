@@ -1021,7 +1021,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Send the extracted files
     for file_path in set(file_matches):
-        file_path = file_path.strip().strip('\'"\\/') # clean up trailing/leading quotes
+        # Strip surrounding whitespace and quotes first (safe on all platforms).
+        # Then strip only TRAILING slashes/backslashes -- do NOT strip leading '/'
+        # because on Linux all absolute paths start with '/' and stripping it
+        # would silently turn '/home/user/file.txt' -> 'home/user/file.txt',
+        # causing a false 'file not found' error. (Bug fixed: 2026-05-14)
+        file_path = file_path.strip().strip('"\'').rstrip('\/')
         if os.path.isfile(file_path):
             try:
                 filename = os.path.basename(file_path)
