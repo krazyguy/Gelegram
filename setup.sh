@@ -352,8 +352,11 @@ WorkingDirectory=$SCRIPT_DIR
 ExecStart=$VENV_PYTHON $SCRIPT_DIR/gateway.py
 Restart=always
 RestartSec=10
-StandardOutput=append:$SCRIPT_DIR/gateway.log
-StandardError=append:$SCRIPT_DIR/gateway.log
+# gateway.py writes its own gateway.log via Python FileHandler.
+# Using 'journal' here prevents duplicate lines in gateway.log (doubled-log-lines bug fix).
+# View live: journalctl --user -u gelegram -f
+StandardOutput=journal
+StandardError=journal
 Environment=HOME=$HOME
 Environment=USER=$CURRENT_USER
 Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR

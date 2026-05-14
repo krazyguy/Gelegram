@@ -8,3 +8,8 @@ python-telegram-bot[job-queue]>=20.0
 
 # .env file loader
 python-dotenv>=1.0.0
+
+# Process utilities – used by gateway.py watchdog to kill orphan bot.py
+# processes on startup, preventing Telegram API "Conflict" errors when the
+# previous instance did not exit cleanly.
+psutil>=5.9.0
