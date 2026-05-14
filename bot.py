@@ -62,6 +62,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gelegram")
 
+# ── Dedicated tool-call audit logger ─────────────────────────────────────────
+# All gemini-cli tool invocations (shell commands, file writes, etc.) are
+# written here so you have a clean audit trail separate from bot/gateway logs.
+# Format: timestamp | method | params JSON
+_tools_file_handler = logging.FileHandler("tools.log", encoding="utf-8")
+_tools_file_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+tools_logger = logging.getLogger("gelegram.tools")
+tools_logger.setLevel(logging.INFO)
+tools_logger.addHandler(_tools_file_handler)
+tools_logger.propagate = False   # keep tools.log clean; don't double-write to bot.log
+
 # Silence overly verbose libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -138,6 +154,12 @@ class GeminiACPClient:
         # and prepended to the first real user response.
         self._bootstrap_response: Optional[str] = None
         self._bootstrap_sent: bool = False
+        # ── Streaming / tool-status callbacks ────────────────────────────────
+        # Set by send_prompt() before each call; cleared after. Allows the
+        # Telegram handler to receive live chunk updates and tool notifications
+        # without tightly coupling GeminiACPClient to Telegram internals.
+        self._on_chunk: Optional[object] = None      # async callable(str)
+        self._on_tool_call: Optional[object] = None  # async callable(method, params)
 
     # ── Private helpers ──────────────────────────────────────────────────────
 
@@ -209,6 +231,10 @@ class GeminiACPClient:
         as side-channel data and their text fragments are returned so callers
         can stream them to Telegram if desired.
 
+        Callbacks (set on self before calling):
+          self._on_chunk(text: str)          – called for each new streamed chunk
+          self._on_tool_call(method, params) – called when a tool is auto-approved
+
         Returns the matched JSON-RPC *result* or raises on *error*.
         """
         deadline = asyncio.get_event_loop().time() + timeout
@@ -228,19 +254,74 @@ class GeminiACPClient:
                 method = msg.get("method", "")
                 params = msg.get("params", {})
 
-                # ── Confirmed gemini-cli streaming format (from live probe) ──
-                # method:  "session/update"
-                # params:  { "sessionId": "...",
-                #             "update": { "sessionUpdate": "agent_message_chunk",
-                #                         "content": { "type": "text",
-                #                                      "text": "<chunk>" } } }
+                # ── session/update: all tool + agent activity arrives here ────
+                # In YOLO (-y) mode, gemini-cli NEVER sends session/request_permission
+                # to the client — it auto-approves all tools internally.
+                # Instead, all activity (text chunks AND tool invocations) arrives
+                # as session/update notifications with different "sessionUpdate" values.
+                # We must inspect every update type here, not just agent_message_chunk.
+                #
+                # Known sessionUpdate values (discovered from live traffic):
+                #   agent_message_chunk  – streamed text fragment
+                #   tool_call_start      – tool invocation starting
+                #   tool_call_complete   – tool invocation finished
+                #   tool_use             – generic tool use event (some CLI versions)
+                #   (any other value)    – unknown, log it anyway for discovery
                 if method == "session/update" and isinstance(params, dict):
                     update = params.get("update", {})
-                    if update.get("sessionUpdate") == "agent_message_chunk":
+                    update_type = update.get("sessionUpdate", "")
+
+                    if update_type == "agent_message_chunk":
+                        # ── Text streaming chunk ──────────────────────────────
                         chunk = update.get("content", {}).get("text", "")
                         if chunk:
                             accumulated_text.append(chunk)
                             logger.debug("ACP chunk: %r", chunk)
+                            # ── Feature: live chunk streaming callback ────────
+                            # Fire the on_chunk callback so handle_message can
+                            # edit a placeholder Telegram message in real-time.
+                            # Errors are suppressed so a Telegram API hiccup
+                            # never disrupts the core ACP response loop.
+                            if self._on_chunk is not None:
+                                try:
+                                    await self._on_chunk("".join(accumulated_text))
+                                except Exception as _cb_err:
+                                    logger.debug("on_chunk callback error (non-fatal): %s", _cb_err)
+
+                    else:
+                        # ── Non-chunk update: tool invocation or unknown event ─
+                        # In YOLO mode these are the ONLY signals we get for tool
+                        # calls. Log everything to tools.log for the audit trail
+                        # and fire the Telegram tool-status callback.
+                        logger.info("ACP session/update [%s]: %s", update_type, str(update)[:300])
+                        try:
+                            tools_logger.info(
+                                "sessionUpdate=%-35s update=%s",
+                                update_type,
+                                json.dumps(update, separators=(",", ":"), ensure_ascii=False)[:2000],
+                            )
+                        except Exception:
+                            pass  # never let logging break the response loop
+
+                        # ── Feature: tool-status push to Telegram ─────────────
+                        if self._on_tool_call is not None and update_type:
+                            try:
+                                await self._on_tool_call(update_type, update)
+                            except Exception as _cb_err:
+                                logger.debug("on_tool_call callback error (non-fatal): %s", _cb_err)
+
+                elif method and method != "session/update":
+                    # ── Any other notification method (log for discovery) ─────
+                    logger.info("ACP notification [%s]: %s", method, str(params)[:300])
+                    try:
+                        tools_logger.info(
+                            "notification=%-40s params=%s",
+                            method,
+                            json.dumps(params, separators=(",", ":"), ensure_ascii=False)[:2000],
+                        )
+                    except Exception:
+                        pass
+
                 continue
 
             # ── Server→client REQUEST (has BOTH 'id' AND 'method') ───────────
@@ -271,6 +352,28 @@ class GeminiACPClient:
                     "Auto-approving server request: method=%s id=%s option=%s",
                     server_method, server_req_id, chosen,
                 )
+
+                # ── Feature: tool-call audit log ─────────────────────────────
+                # Write every auto-approved tool invocation to tools.log with
+                # full params so you have a clean audit trail.
+                try:
+                    tools_logger.info(
+                        "method=%-40s params=%s",
+                        server_method,
+                        json.dumps(params, separators=(",", ":"), ensure_ascii=False)[:2000],
+                    )
+                except Exception:
+                    pass   # never let logging break the approval flow
+
+                # ── Feature: tool-status push to Telegram ─────────────────────
+                # If a callback is registered, notify the user which tool is
+                # being invoked. Errors are suppressed (non-fatal).
+                if self._on_tool_call is not None:
+                    try:
+                        await self._on_tool_call(server_method, params)
+                    except Exception as _cb_err:
+                        logger.debug("on_tool_call callback error (non-fatal): %s", _cb_err)
+
                 # Confirmed schema from live logs:
                 # result.outcome.outcome  = "selected" | "cancelled"  (discriminator)
                 # result.outcome.optionId = the chosen optionId string
@@ -641,7 +744,14 @@ class GeminiACPClient:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    async def send_prompt(self, text: str, user_name: str = "user", on_timeout_callback=None) -> str:
+    async def send_prompt(
+        self,
+        text: str,
+        user_name: str = "user",
+        on_timeout_callback=None,
+        on_chunk=None,
+        on_tool_call=None,
+    ) -> str:
         """
         Send `text` to gemini-cli and return the full text response.
 
@@ -658,78 +768,63 @@ class GeminiACPClient:
             Exception      – Subprocess crashed or other unexpected error
         """
         async with self._lock:
-            # Restart process if it crashed since the last call
-            await self._ensure_running()
+            # ── Register per-call streaming / tool callbacks ───────────────
+            # These are stored on self so _recv_response (which has no direct
+            # reference to the caller) can invoke them without coupling.
+            # They are always cleared in the finally block below.
+            self._on_chunk     = on_chunk
+            self._on_tool_call = on_tool_call
+            try:
+                return await self._send_prompt_inner(
+                    text, user_name, on_timeout_callback
+                )
+            finally:
+                # Always clear callbacks so they don't leak to the next call
+                self._on_chunk     = None
+                self._on_tool_call = None
 
-            # ── Bootstrap primer intercept ────────────────────────────────
-            # If we cached a bootstrap primer response, return it for the
-            # user's very first message so they see the identity setup
-            # questions immediately.  The primer already primed the Gemini
-            # session context, so subsequent messages flow normally.
-            if self._bootstrap_response is not None:
-                cached = self._bootstrap_response
-                self._bootstrap_response = None  # consume once
-                logger.info("Returning cached bootstrap primer response to user")
+    async def _send_prompt_inner(
+        self,
+        text: str,
+        user_name: str = "user",
+        on_timeout_callback=None,
+    ) -> str:
+        """
+        Internal implementation of send_prompt, called after callbacks are
+        registered. Must be called while self._lock is already held by the
+        caller (send_prompt acquires and holds it for the full call).
+        """
+        # Restart process if it crashed since the last call
+        await self._ensure_running()
 
-                # Still log the user message + bootstrap response to transcript
-                if self._transcript_file and not self.private_mode:
-                    import datetime
-                    time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    with open(self._transcript_file, "a", encoding="utf-8") as f:
-                        f.write(f"{time_str} : {user_name} : {text}\n")
-                        f.write(f"{time_str} : gemini : {cached}\n")
+        # ── Bootstrap primer intercept ────────────────────────────────────
+        # If we cached a bootstrap primer response, return it for the
+        # user's very first message so they see the identity setup
+        # questions immediately.  The primer already primed the Gemini
+        # session context, so subsequent messages flow normally.
+        if self._bootstrap_response is not None:
+            cached = self._bootstrap_response
+            self._bootstrap_response = None  # consume once
+            logger.info("Returning cached bootstrap primer response to user")
 
-                # Forward the user's actual text to Gemini so the agent has
-                # it in its context for the next turn (non-blocking fire-and-forget
-                # would be complex here — instead we send it and use the response
-                # ONLY if the bootstrap response was empty for some reason).
-                prompt_id = self._next_id()
-                self._active_req_id = prompt_id
-                await self._send({
-                    "jsonrpc": "2.0",
-                    "id": prompt_id,
-                    "method": "session/prompt",
-                    "params": {
-                        "sessionId": self._session_id,
-                        "prompt": [
-                            {"type": "text", "text": text}
-                        ],
-                    },
-                })
-                try:
-                    followup = await self._recv_response(prompt_id, timeout=ACP_TIMEOUT)
-                    # Extract followup text in case bootstrap primer + user text
-                    # triggers additional relevant output
-                    followup_text = ""
-                    if "_notification_text" in followup and followup["_notification_text"].strip():
-                        followup_text = followup["_notification_text"].strip()
-                    elif "text" in followup and followup["text"]:
-                        followup_text = str(followup["text"]).strip()
-                    if followup_text:
-                        # Combine: show bootstrap greeting + any followup
-                        cached = cached + "\n\n" + followup_text
-                        logger.info("Appended followup response (%d chars)", len(followup_text))
-                except Exception as e:
-                    logger.warning("Followup after bootstrap primer failed (non-fatal): %s", e)
-                finally:
-                    self._active_req_id = None
-
-                return cached
-
-            # Log user message to transcript
+            # Still log the user message + bootstrap response to transcript
             if self._transcript_file and not self.private_mode:
                 import datetime
                 time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with open(self._transcript_file, "a", encoding="utf-8") as f:
                     f.write(f"{time_str} : {user_name} : {text}\n")
+                    f.write(f"{time_str} : gemini : {cached}\n")
 
+            # Forward the user's actual text to Gemini so the agent has
+            # it in its context for the next turn (non-blocking fire-and-forget
+            # would be complex here — instead we send it and use the response
+            # ONLY if the bootstrap response was empty for some reason).
             prompt_id = self._next_id()
             self._active_req_id = prompt_id
-            
             await self._send({
                 "jsonrpc": "2.0",
                 "id": prompt_id,
-                "method": "session/prompt",      # confirmed method name in gemini-cli ACP
+                "method": "session/prompt",
                 "params": {
                     "sessionId": self._session_id,
                     "prompt": [
@@ -737,49 +832,90 @@ class GeminiACPClient:
                     ],
                 },
             })
-
             try:
-                result = await self._recv_response(prompt_id, timeout=ACP_TIMEOUT)
-            except asyncio.TimeoutError:
-                if on_timeout_callback:
-                    try:
-                        await on_timeout_callback()
-                    except Exception as e:
-                        logger.error("Error in on_timeout_callback: %s", e)
-                # Continue waiting with a generous 30-minute timeout for heavy tasks
-                result = await self._recv_response(prompt_id, timeout=1800)
+                followup = await self._recv_response(prompt_id, timeout=ACP_TIMEOUT)
+                # Extract followup text in case bootstrap primer + user text
+                # triggers additional relevant output
+                followup_text = ""
+                if "_notification_text" in followup and followup["_notification_text"].strip():
+                    followup_text = followup["_notification_text"].strip()
+                elif "text" in followup and followup["text"]:
+                    followup_text = str(followup["text"]).strip()
+                if followup_text:
+                    # Combine: show bootstrap greeting + any followup
+                    cached = cached + "\n\n" + followup_text
+                    logger.info("Appended followup response (%d chars)", len(followup_text))
+            except Exception as e:
+                logger.warning("Followup after bootstrap primer failed (non-fatal): %s", e)
             finally:
                 self._active_req_id = None
 
-            # ── Extract plain text from the result payload ────────────────
-            response_text = ""
-            if "_notification_text" in result and result["_notification_text"].strip():
-                response_text = result["_notification_text"].strip()
-            elif "text" in result and result["text"]:
-                response_text = str(result["text"]).strip()
-            elif result.get("candidates", []):
-                parts = result["candidates"][0].get("content", {}).get("parts", [])
-                text_parts = [p["text"] for p in parts if "text" in p]
-                if text_parts:
-                    response_text = "".join(text_parts).strip()
-            
-            if not response_text and "content" in result and result["content"]:
-                response_text = str(result["content"]).strip()
-            if not response_text and "message" in result and result["message"]:
-                response_text = str(result["message"]).strip()
-            
-            if not response_text:
-                logger.warning("Could not extract text from ACP result: %s", result)
-                response_text = json.dumps(result, indent=2)
+            return cached
 
-            # Log Gemini response to transcript
-            if self._transcript_file and not self.private_mode:
-                import datetime
-                time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(self._transcript_file, "a", encoding="utf-8") as f:
-                    f.write(f"{time_str} : gemini : {response_text}\n")
-                    
-            return response_text
+        # Log user message to transcript
+        if self._transcript_file and not self.private_mode:
+            import datetime
+            time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self._transcript_file, "a", encoding="utf-8") as f:
+                f.write(f"{time_str} : {user_name} : {text}\n")
+
+        prompt_id = self._next_id()
+        self._active_req_id = prompt_id
+
+        await self._send({
+            "jsonrpc": "2.0",
+            "id": prompt_id,
+            "method": "session/prompt",      # confirmed method name in gemini-cli ACP
+            "params": {
+                "sessionId": self._session_id,
+                "prompt": [
+                    {"type": "text", "text": text}
+                ],
+            },
+        })
+
+        try:
+            result = await self._recv_response(prompt_id, timeout=ACP_TIMEOUT)
+        except asyncio.TimeoutError:
+            if on_timeout_callback:
+                try:
+                    await on_timeout_callback()
+                except Exception as e:
+                    logger.error("Error in on_timeout_callback: %s", e)
+            # Continue waiting with a generous 30-minute timeout for heavy tasks
+            result = await self._recv_response(prompt_id, timeout=1800)
+        finally:
+            self._active_req_id = None
+
+        # ── Extract plain text from the result payload ────────────────────
+        response_text = ""
+        if "_notification_text" in result and result["_notification_text"].strip():
+            response_text = result["_notification_text"].strip()
+        elif "text" in result and result["text"]:
+            response_text = str(result["text"]).strip()
+        elif result.get("candidates", []):
+            parts = result["candidates"][0].get("content", {}).get("parts", [])
+            text_parts = [p["text"] for p in parts if "text" in p]
+            if text_parts:
+                response_text = "".join(text_parts).strip()
+
+        if not response_text and "content" in result and result["content"]:
+            response_text = str(result["content"]).strip()
+        if not response_text and "message" in result and result["message"]:
+            response_text = str(result["message"]).strip()
+
+        if not response_text:
+            logger.warning("Could not extract text from ACP result: %s", result)
+            response_text = json.dumps(result, indent=2)
+
+        # Log Gemini response to transcript
+        if self._transcript_file and not self.private_mode:
+            import datetime
+            time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self._transcript_file, "a", encoding="utf-8") as f:
+                f.write(f"{time_str} : gemini : {response_text}\n")
+
+        return response_text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -808,26 +944,143 @@ def get_client(chat_id: int) -> GeminiACPClient:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /start command – send a welcome message."""
+    """Handle /start – send a welcome message then auto-load memory so the
+    user is ready to chat immediately without a slow first-message startup."""
     await update.message.reply_text(
         "👋 Hello! I'm your Gemini CLI bridge bot.\n\n"
         "Send me any message and I'll relay it to Gemini through the ACP server.\n\n"
         "Commands:\n"
         "  /start    – Show this message\n"
         "  /reset    – Reset the Gemini session\n"
+        "  /new      – Same as /reset\n"
+        "  /memory   – Warm up session (load memory & identity)\n"
         "  /private  – Toggle private mode (no logging)\n"
-        "  /status   – Check the ACP subprocess status"
+        "  /status   – Check the ACP subprocess status\n"
+        "  /kill     – Cancel active request"
     )
+    # Auto-load memory so the user can chat immediately
+    await cmd_memory(update, context)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /reset – tear down and restart the ACP subprocess + session."""
+    """Handle /reset (/new) – tear down the ACP session and immediately
+    pre-warm it so the user's next message gets an instant reply."""
     await update.message.reply_text("🔄 Resetting Gemini session …")
     acp_client = get_client(update.effective_chat.id)
     await acp_client.stop()
-    await update.message.reply_text(
-        "✅ Session reset. Your next message will start a fresh Gemini session."
+    # Auto-trigger memory warm-up — no need for the user to send /memory
+    await cmd_memory(update, context)
+
+
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /new – alias for /reset (resets session + auto-loads memory)."""
+    await cmd_reset(update, context)
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /memory – pre-warm the Gemini session by sending a silent startup
+    primer that tells the agent to read its identity and memory files.
+
+    This is useful after /reset so the first real message gets an instant reply
+    instead of making the user wait for Gemini to re-read all its startup files.
+
+    Shows the live activity panel while it runs so the user can see the files
+    being loaded (SOUL.md, MEMORY.md, etc.).
+    """
+    chat_id = update.effective_chat.id
+    acp_client = get_client(chat_id)
+
+    # Send the activity panel immediately
+    panel_msg = None
+    try:
+        panel_msg = await update.message.reply_text(
+            "⚙️ Loading memory …\n"
+            "_(Gemini is reading identity & memory files)_"
+        )
+    except Exception:
+        pass
+
+    # Tool + chunk callbacks that edit the panel message in-place
+    _tool_lines: list[str] = []
+    _seen_ids: set[str] = set()
+    _last_edit = [0.0]
+    _THROTTLE = 1.2
+
+    _KIND_EMOJI: dict[str, str] = {
+        "read": "📖", "write": "✏️", "search": "🔍",
+        "shell": "⚡", "think": "🧠", "fetch": "🌐", "list": "📂",
+    }
+    _SILENT = {"tool_call_update", "agent_thought_chunk",
+                "available_commands_update", "agent_message_chunk"}
+
+    async def _edit(text: str) -> None:
+        if panel_msg is None:
+            return
+        now = asyncio.get_event_loop().time()
+        if now - _last_edit[0] < _THROTTLE:
+            return
+        _last_edit[0] = now
+        try:
+            await panel_msg.edit_text(text[:4000])
+        except Exception:
+            pass
+
+    async def _on_tool(update_type: str, upd: dict) -> None:
+        if update_type in _SILENT:
+            return
+        if update_type != "tool_call":
+            return
+        if upd.get("status") != "in_progress":
+            return
+        tid = upd.get("toolCallId", "")
+        if tid and tid in _seen_ids:
+            return
+        if tid:
+            _seen_ids.add(tid)
+        kind  = upd.get("kind", "")
+        title = upd.get("title", "")
+        emoji = _KIND_EMOJI.get(kind, "🔧")
+        # Status-bar style: replace the current tool line, don't accumulate
+        _tool_lines[0:] = [f"{emoji} {title or kind}"]  # keep only latest
+        panel = f"⚙️ Loading memory …\n{_tool_lines[0]}"
+        await _edit(panel)
+
+    async def _on_chunk(_: str) -> None:
+        pass  # silently discard streamed text during warm-up
+
+    # The primer prompt — instructs Gemini to do its normal session startup
+    MEMORY_PRIMER = (
+        "[SYSTEM] Perform your standard session startup protocol now: "
+        "read SOUL.md, MEMORY.md, today's memory log, and TODO.md. "
+        "Do NOT greet the user or send any message. "
+        "Just confirm internally that you are loaded and ready."
     )
+
+    try:
+        await acp_client.send_prompt(
+            MEMORY_PRIMER,
+            user_name="system",
+            on_chunk=_on_chunk,
+            on_tool_call=_on_tool,
+        )
+        # Show final loaded state then replace with confirmation
+        final_panel = "✅ Memory loaded!"
+        if panel_msg:
+            try:
+                await panel_msg.edit_text(final_panel)
+            except Exception:
+                await update.message.reply_text(final_panel)
+    except Exception as exc:
+        logger.error("cmd_memory failed: %s", exc)
+        err_text = f"❌ Memory warm-up failed: `{exc}`"
+        if panel_msg:
+            try:
+                await panel_msg.edit_text(err_text)
+            except Exception:
+                await update.message.reply_text(err_text)
+        else:
+            await update.message.reply_text(err_text)
 
 async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /kill – attempt to cancel the active request without killing the session."""
@@ -870,9 +1123,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     with the response.
 
     Flow:
-      1. Send a "typing…" action so the user knows we're working.
-      2. Forward the message to GeminiACPClient.send_prompt().
-      3. Handle errors gracefully and always reply to the user.
+      1. Send a live activity panel message ("⚙️ Working …") immediately.
+      2. As tools fire, append lines to the panel (edited in-place).
+      3. When text starts streaming, the panel transitions to show the text.
+      4. On completion, delete the panel and send the final full reply.
     """
     user_text = update.message.text or update.message.caption or ""
     user      = update.effective_user
@@ -882,19 +1136,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if attachment:
         if isinstance(attachment, (list, tuple)):
             attachment = attachment[-1]  # Get highest resolution photo
-        
+
         file_id = attachment.file_id
         file_name = getattr(attachment, "file_name", f"{file_id}.jpg" if update.message.photo else f"{file_id}.file")
-        
+
         # Ensure incoming directory exists
         incoming_dir = Path(GEMINI_WORKING_DIR) / "media" / "incoming"
         incoming_dir.mkdir(parents=True, exist_ok=True)
         file_path = incoming_dir / file_name
-        
+
         # Download file
         file_obj = await context.bot.get_file(file_id)
         await file_obj.download_to_drive(custom_path=file_path)
-        
+
         # Tell Gemini about the file
         file_notice = f"[User attached a file, saved to: {file_path.absolute()}]"
         user_text = f"{user_text}\n{file_notice}".strip()
@@ -905,10 +1159,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if media_group_id not in media_groups:
             media_groups[media_group_id] = []
         media_groups[media_group_id].append(user_text)
-        
+
         # Wait slightly to allow all album parts to arrive from Telegram
         await asyncio.sleep(1.5)
-        
+
         # Only the first message processed for this group will actually send it
         if media_group_id in media_groups:
             all_parts = media_groups.pop(media_group_id)
@@ -928,7 +1182,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     chat_id = update.effective_chat.id
-    
+
     # ── Password Authentication ──────────────────────────────────────────────
     if BOT_PASSWORD and chat_id not in trusted_users:
         if user_text.strip() == BOT_PASSWORD:
@@ -939,6 +1193,117 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await update.message.reply_text("🔒 Please provide the bot password to use this bot.")
             return
+
+    # ── Live activity panel – ONE message, updated in-place ──────────────────
+    # This single message serves double duty:
+    #   Phase 1 (tool calls): shows a growing list of tools Gemini is using
+    #   Phase 2 (streaming):  transitions to showing the live text as it streams
+    #
+    # Both on_tool_call and on_chunk edit this same message.
+    # It is deleted in the finally block and replaced by the real final reply.
+    #
+    # Throttle: Telegram allows ~1 edit/second; we use 1.2s to be safe.
+    _status_msg = None              # single shared Telegram Message
+    _last_edit_time = 0.0           # epoch time of last edit (for throttle)
+    _STATUS_THROTTLE = 1.2          # seconds between edits
+    _last_tool_line = [""]          # single cell: the current active tool line
+    _in_text_phase = [False]        # True once on_chunk has taken over
+
+    try:
+        _status_msg = await update.message.reply_text("⚙️ Working …")
+    except Exception as _se:
+        logger.debug("Could not send activity panel: %s", _se)
+
+    async def _edit_status(text: str) -> None:
+        """Throttled in-place edit of the shared status message."""
+        nonlocal _last_edit_time
+        if _status_msg is None:
+            return
+        now = asyncio.get_event_loop().time()
+        if now - _last_edit_time < _STATUS_THROTTLE:
+            return
+        _last_edit_time = now
+        try:
+            await _status_msg.edit_text(text[:4000])
+        except Exception:
+            pass  # "message not modified" or Telegram hiccup — both fine
+
+    # Emoji map keyed on the "kind" field of tool_call events
+    # (discovered from live tools.log traffic)
+    _KIND_EMOJI: dict[str, str] = {
+        "read":   "📖",
+        "write":  "✏️",
+        "search": "🔍",
+        "shell":  "⚡",
+        "think":  "🧠",
+        "exec":   "⚡",
+        "fetch":  "🌐",
+        "list":   "📂",
+    }
+
+    # update_types that are internal noise — never surface to user
+    _SILENT_TYPES: set[str] = {
+        "tool_call_update",           # completion events (we show starts only)
+        "agent_thought_chunk",        # internal chain-of-thought
+        "available_commands_update",  # startup handshake
+        "agent_message_chunk",        # handled by on_chunk below
+    }
+
+    _seen_tool_ids: set[str] = set()  # deduplicate by toolCallId
+
+    async def on_tool_call(update_type: str, update_data: dict) -> None:
+        """
+        Append a new tool-call line to the live activity panel and edit it.
+
+        Only tool_call events with status=in_progress are shown (one line each).
+        All other update types are suppressed.
+        Once on_chunk has taken over (text is streaming), tool lines are ignored
+        so we don't fight over the same message.
+        """
+        # Don't overwrite the message once text streaming has started
+        if _in_text_phase[0]:
+            return
+
+        # Suppress noise events
+        if update_type in _SILENT_TYPES:
+            return
+
+        if update_type == "tool_call":
+            if update_data.get("status") != "in_progress":
+                return
+
+            tool_id = update_data.get("toolCallId", "")
+            if tool_id and tool_id in _seen_tool_ids:
+                return
+            if tool_id:
+                _seen_tool_ids.add(tool_id)
+
+            kind  = update_data.get("kind", "")
+            title = update_data.get("title", "")
+            emoji = _KIND_EMOJI.get(kind, "🔧")
+            label = title or kind or update_type
+
+            # Status-bar style: show only the CURRENT active tool (not history)
+            _last_tool_line[0] = f"{emoji} {label}"
+            panel = f"⚙️ Working …\n{_last_tool_line[0]}"
+            await _edit_status(panel)
+
+        # Unknown update type: replace current line for discoverability
+        elif update_type and update_type not in _seen_tool_ids:
+            _seen_tool_ids.add(update_type)
+            _last_tool_line[0] = f"🔧 {update_type}"
+            panel = f"⚙️ Working …\n{_last_tool_line[0]}"
+            await _edit_status(panel)
+
+    async def on_chunk(accumulated: str) -> None:
+        """
+        Switch the activity panel to live-text mode and update it with
+        the growing response text. Once this fires, tool lines stop updating.
+        """
+        _in_text_phase[0] = True  # lock out on_tool_call from editing
+        # Show a preview; mark as partial with ellipsis
+        preview = accumulated[:3900] + " …" if len(accumulated) > 3900 else accumulated
+        await _edit_status(preview)
 
     # Continuous typing indicator task
     async def keep_typing():
@@ -964,7 +1329,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         response = await acp_client.send_prompt(
             user_text,
             user_name=display_name,
-            on_timeout_callback=notify_timeout
+            on_timeout_callback=notify_timeout,
+            on_chunk=on_chunk,
+            on_tool_call=on_tool_call,
         )
 
     except asyncio.TimeoutError:
@@ -992,6 +1359,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     finally:
         typing_task.cancel()
+        # Delete the live activity panel so the final reply stands alone cleanly.
+        if _status_msg is not None:
+            try:
+                await _status_msg.delete()
+            except Exception:
+                pass  # ignore if already deleted or permission issue
 
     import re
     import os
@@ -1068,11 +1441,13 @@ def main() -> None:
 
     async def post_init(app: Application) -> None:
         await app.bot.set_my_commands([
-            BotCommand("start", "Show welcome message"),
-            BotCommand("reset", "Reset the Gemini session"),
+            BotCommand("start",   "Show welcome message"),
+            BotCommand("reset",   "Reset the Gemini session"),
+            BotCommand("new",     "New session (same as /reset)"),
+            BotCommand("memory",  "Pre-load identity & memory (warm-up)"),
             BotCommand("private", "Toggle private mode (no logging)"),
-            BotCommand("status", "Check ACP subprocess status"),
-            BotCommand("kill", "Cancel active request"),
+            BotCommand("status",  "Check ACP subprocess status"),
+            BotCommand("kill",    "Cancel active request"),
         ])
 
     # Build the Application (v20+ PTB style)
@@ -1085,11 +1460,13 @@ def main() -> None:
     )
 
     # Register handlers
-    application.add_handler(CommandHandler("start",  cmd_start))
-    application.add_handler(CommandHandler("reset",  cmd_reset))
-    application.add_handler(CommandHandler("kill",   cmd_kill))
+    application.add_handler(CommandHandler("start",   cmd_start))
+    application.add_handler(CommandHandler("reset",   cmd_reset))
+    application.add_handler(CommandHandler("new",     cmd_new))
+    application.add_handler(CommandHandler("memory",  cmd_memory))
+    application.add_handler(CommandHandler("kill",    cmd_kill))
     application.add_handler(CommandHandler("private", cmd_private))
-    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("status",  cmd_status))
     application.add_handler(
         MessageHandler(~filters.COMMAND, handle_message)
     )

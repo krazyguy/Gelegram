@@ -67,6 +67,9 @@ The setup script will:
 | 🖥️ **Cross-platform service** | Windows (NSSM), Linux (systemd), macOS (launchd) — all via one setup script |
 | 🔄 **Watchdog gateway** | Exponential backoff restart if the agent process crashes |
 | 🔍 **Startup CLI validation** | Gateway checks Gemini CLI path on start, warns early if misconfigured |
+| 📊 **Tool call audit log** | Every tool Gemini invokes is logged to `tools.log` with full params |
+| ⚡ **Live activity panel** | A single Telegram message updates in real-time showing the current tool being used |
+| 🔥 **Session warm-up** | `/memory` (or auto on `/start`/`/reset`) pre-loads identity & memory so first replies are instant |
 
 ---
 
@@ -232,8 +235,10 @@ Expected output:
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome message and usage instructions |
-| `/reset` | Terminate and restart the Gemini session (fresh context) |
+| `/start` | Welcome message, then auto-loads memory so you can chat immediately |
+| `/reset` | Restart the Gemini session, then auto-loads memory |
+| `/new` | Alias for `/reset` |
+| `/memory` | Pre-warm session — loads identity & memory files silently (shows live tool panel) |
 | `/kill` | Cancel the active long-running request without resetting the session |
 | `/private` | Toggle private mode — disables transcript logging for this session |
 | `/status` | Show ACP subprocess status (PID, session ID, timeout) |
@@ -412,6 +417,28 @@ The ACP server communicates via **newline-delimited JSON** on `stdin`/`stdout`:
 - `concurrent_updates=True` allows multiple chats to be handled simultaneously.
 - Each chat ID gets its own `GeminiACPClient` instance with an isolated session.
 
+### Live Observability
+
+Gelegram provides real-time visibility into what the agent is doing while it processes your message:
+
+**Live activity panel** — a single Telegram message is sent immediately when you submit a request. It acts as a live status bar:
+
+```
+⚙️ Working …
+📖 MEMORY.md          ← updates to the current tool in real-time
+```
+
+When the agent starts streaming its reply, the panel transitions to show a text preview. When the final response is sent, the panel is silently deleted — leaving only the clean reply.
+
+**Tool call audit log** — every tool invocation (file reads, shell commands, web searches) is written to `tools.log` with a timestamp and full parameters:
+
+```
+2026-05-14 22:01:34 | sessionUpdate=tool_call   update={"kind":"read","title":"SOUL.md",...}
+2026-05-14 22:01:35 | sessionUpdate=tool_call   update={"kind":"read","title":"MEMORY.md",...}
+```
+
+**Session warm-up** — `/memory` (automatically triggered by `/start`, `/reset`, and `/new`) sends a silent primer to Gemini asking it to read all startup files. The user sees the live tool panel while this runs, then `✅ Memory loaded!` — and the next real message gets an instant reply.
+
 ### Tool Auto-Approval
 
 `gemini --acp -y` runs in YOLO mode. When Gemini emits a `session/request_permission` server-request for tool actions, the bot automatically responds with `proceed_always`. This allows Gemini to edit files, run shell commands, and use web search without manual confirmation.
@@ -441,6 +468,7 @@ gelegram/
 ├── trusted_users.json    <- Authenticated chat IDs (auto-managed)
 ├── bot.log               <- Bot runtime log (created on first run)
 ├── gateway.log           <- Gateway lifecycle log
+├── tools.log             <- Tool call audit log (every Gemini tool invocation)
 ├── bot.pid               <- Current bot.py PID (auto-managed)
 ├── workdir/              <- Default agentic workspace (see GEMINI_WORKING_DIR)
 └── logs/                 <- Service stdout/stderr logs (created by service managers)
@@ -458,13 +486,14 @@ gelegram/
 | `Conflict: terminated by other getUpdates` | Wait 10s and try again; the gateway handles this automatically on restart |
 | `ACP error` in logs | Check `bot.log` for the raw JSON-RPC error message |
 | Timeout after `ACP_TIMEOUT` seconds | The user is notified automatically; bot waits up to 30 min. Increase `ACP_TIMEOUT` for complex tasks |
-| Bot stops responding | Send `/reset` to restart the Gemini session |
-| Session not persisting after restart | This is expected — send any message and a fresh session starts automatically |
+| Bot stops responding | Send `/reset` to restart and auto-reload memory |
+| Session not persisting after restart | This is expected — send any message or `/memory` and a fresh session starts automatically |
 | `EOFError: ACP subprocess closed stdout` | Gemini CLI crashed; the bot auto-restarts it on the next message |
 | Windows service not starting | Run `install_service.ps1` as Administrator; check `logs/` for NSSM output |
 | Linux service not starting | Run `journalctl --user -u gelegram -n 50` to see startup errors |
 | macOS service not starting | Run `tail -50 gateway.log`; check plist with `launchctl list \| grep gelegram` |
 | Gateway warns "Gemini CLI could not be found" | Set `GEMINI_CLI_PATH` in `.env` to the absolute path of `gemini` or `gemini.cmd` |
+| `tools.log` is empty | The bot hasn't processed a message yet — tool calls only appear after Gemini uses a tool |
 
 ### Enable Debug Logging
 
