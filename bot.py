@@ -443,7 +443,7 @@ class GeminiACPClient:
                 "clientCapabilities": {},
             },
         })
-        init_result = await self._recv_response(init_id, timeout=30)
+        init_result = await self._recv_response(init_id, timeout=90)
         # authMethods in the response is metadata only — it lists what auth
         # providers are configured on the server.  No auth/select call needed;
         # no 'initialized' notification needed (gemini-cli returns -32601 for it).
@@ -473,7 +473,7 @@ class GeminiACPClient:
                 "trustedFolders": [GEMINI_WORKING_DIR],
             },
         })
-        sess_result = await self._recv_response(sess_id, timeout=30)
+        sess_result = await self._recv_response(sess_id, timeout=90)
         self._session_id = sess_result.get("sessionId") or sess_result.get("id")
         logger.info("ACP session created: %s", self._session_id)
 
@@ -696,15 +696,36 @@ class GeminiACPClient:
         Guarantee the subprocess is alive and the ACP handshake has been
         completed.  If the process is dead (crashed, never started), it is
         restarted and re-initialised transparently.
+
+        IMPORTANT: Any asyncio.TimeoutError raised by _initialize() (the
+        ACP handshake, which uses its own 90-second timeouts) is wrapped
+        into a RuntimeError here.  This prevents it from being caught by
+        the Telegram handler's `except asyncio.TimeoutError` block, which
+        is reserved exclusively for prompt-level 30-minute timeouts and
+        would otherwise log a misleading "30 mins passed" error message
+        on the very first message after a bot restart or cold start.
         """
         if not self._is_alive():
             logger.info("ACP process is not running – starting …")
             self._initialized = False
             self._session_id  = None
             await self._start_process()
-            await self._initialize()
+            try:
+                await self._initialize()
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"ACP handshake timed out during startup – gemini-cli took too long to "
+                    f"respond. This is a startup failure, not a 30-minute prompt timeout. "
+                    f"Original error: {exc}"
+                ) from exc
         elif not self._initialized:
-            await self._initialize()
+            try:
+                await self._initialize()
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"ACP handshake timed out during re-initialization – gemini-cli took "
+                    f"too long to respond. Original error: {exc}"
+                ) from exc
 
     async def stop(self) -> None:
         """Gracefully terminate the gemini-cli subprocess."""
@@ -1467,6 +1488,8 @@ def main() -> None:
     application.add_handler(CommandHandler("kill",    cmd_kill))
     application.add_handler(CommandHandler("private", cmd_private))
     application.add_handler(CommandHandler("status",  cmd_status))
+
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€       
     application.add_handler(
         MessageHandler(~filters.COMMAND, handle_message)
     )
