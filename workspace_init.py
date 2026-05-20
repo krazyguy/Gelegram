@@ -300,7 +300,7 @@ def extract_key_lines(transcript_text: str, max_lines: int = 50) -> list[str]:
 
     Strategy:
       - Skip very short lines (likely just acknowledgements)
-      - Prioritize lines from the 'gemini' speaker that contain substance
+      - Prioritize lines from the 'agent' or 'assistant' speaker that contain substance
       - Capture user questions/requests for context
       - Limit output to max_lines to keep summaries concise
     """
@@ -322,7 +322,7 @@ def extract_key_lines(transcript_text: str, max_lines: int = 50) -> list[str]:
             if len(content) < 10:
                 continue
 
-            # Keep user messages (context) and substantive gemini messages
+            # Keep user messages (context) and substantive agent messages
             key_lines.append(f"[{speaker}] {content}")
 
         if len(key_lines) >= max_lines:
@@ -445,6 +445,292 @@ if __name__ == "__main__":
 # ─────────────────────────────────────────────────────────────────────────────
 PROCESSED_SESSIONS_JSON = json.dumps({"processed": []}, indent=2)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Template: skills/run-commands/SKILL.md — /run command skill documentation
+# ─────────────────────────────────────────────────────────────────────────────
+# Teaches the agent how to help users create and manage preset /run commands
+# by editing run.json. See bot.py cmd_run() for the execution side.
+# ─────────────────────────────────────────────────────────────────────────────
+RUN_COMMANDS_SKILL_MD = r"""# Run Commands Skill
+
+## Description
+Execute preset shell commands directly from Telegram using `/run <alias>`.
+Commands are defined in `run.json` in the workspace root. This bypasses
+Gemini entirely — the bot executes the command as a subprocess and sends
+stdout/stderr back to the user.
+
+## When to Use This Skill
+When the user asks you to:
+- "Add a run command" / "Create a /run command"
+- "Set up a shortcut for [some command]"
+- "Make a quick command for [task]"
+- "Edit run.json" / "Show my run commands"
+- "Remove a run command"
+
+## run.json Schema
+
+The file lives at the workspace root: `run.json`
+
+```json
+{
+  "commands": {
+    "alias-name": {
+      "cmd": "the shell command to execute",
+      "description": "Human-readable description shown in /run listing",
+      "timeout": 30,
+      "args": true
+    }
+  },
+  "defaults": {
+    "timeout": 30,
+    "shell": true
+  }
+}
+```
+
+### Command Fields
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cmd` | string | *required* | The shell command to execute |
+| `description` | string | `""` | Shown when user sends `/run` with no args |
+| `timeout` | int | `30` | Max seconds before the process is killed |
+| `args` | bool | `true` | If true, extra words after the alias are appended to `cmd` |
+
+### String Shorthand
+For simple commands, you can use a string instead of an object:
+```json
+{
+  "commands": {
+    "hello": "echo Hello from Gelegram!"
+  }
+}
+```
+This is equivalent to `{"cmd": "echo Hello from Gelegram!", "args": true}` with default timeout.
+
+## How to Add a Command
+
+When the user asks to add a run command:
+
+1. Read the current `run.json` (create it if it doesn't exist)
+2. Add the new entry under `commands`
+3. Write the updated JSON back
+4. Confirm to the user: "Added `/run <alias>` → `<cmd>`"
+
+### Example: User says "add a run command called sysinfo that shows system info"
+
+Edit `run.json` to add:
+```json
+{
+  "commands": {
+    "sysinfo": {
+      "cmd": "systeminfo",
+      "description": "Show Windows system information",
+      "timeout": 15
+    }
+  }
+}
+```
+
+## Safety Guidelines
+
+- **No secrets in cmd:** Never put passwords, tokens, or API keys directly in `cmd`. Use environment variables or scripts that read from `.env`.
+- **Use scripts for complex logic:** If a command needs multiple steps, pipes, or conditionals, create a script in `scripts/` and reference it: `"cmd": "python scripts/my_task.py"`
+- **Set reasonable timeouts:** A hung command blocks the Telegram response. Default 30s is fine for quick tasks; increase for long-running ones but cap at 300s.
+- **Test before saving:** If unsure about a command, run it manually first.
+
+## How /run Works (For Context)
+
+1. User sends `/run check-mail` in Telegram
+2. Bot reads `run.json`, finds `check-mail` → `"python scripts/check_mail.py"`
+3. Bot runs `asyncio.create_subprocess_shell(cmd, cwd=workdir)`
+4. Stdout + stderr are captured and sent back as a Telegram message
+5. Gemini CLI is NOT involved — this is a direct execution path
+
+## Telegram Behavior
+
+- `/run` (no args) → lists all available commands with descriptions
+- `/run <alias>` → executes the command
+- `/run <alias> <extra args>` → appends extra args to cmd (if `args: true`)
+- Unknown alias → suggests similar commands
+- Timeout → process is killed and user is notified
+- Exit code ≠ 0 → warning shown with stderr
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Template: run.json — Starter preset commands config (empty)
+# ─────────────────────────────────────────────────────────────────────────────
+RUN_JSON = json.dumps({
+    "commands": {},
+    "defaults": {
+        "timeout": 30,
+        "shell": True
+    }
+}, indent=2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Template: skills/cron-scheduler/SKILL.md — scheduler skill documentation
+# ─────────────────────────────────────────────────────────────────────────────
+CRON_SCHEDULER_SKILL_MD = r"""# Cron Scheduler Skill
+
+## Description
+Schedule automated commands to run on a timer or at fixed times.
+Jobs are defined in `cron.json` in the workspace root and executed by the
+scheduler running inside `gateway.py`. Output is sent to you via Telegram.
+The scheduler runs 24/7, independently of Gemini sessions — it survives
+session resets and bot restarts.
+
+## When to Use This Skill
+When the user asks you to:
+- "Add a cron job / scheduled task / automation"
+- "Run [something] every X minutes/hours"
+- "Schedule [something] at [time] every day"
+- "Check [something] automatically on a schedule"
+- "Set up a reminder at [time]"
+- "Run [something] once on [date]"
+- "Show/list my cron jobs"
+- "Disable / enable / remove a cron job"
+- "Edit cron.json"
+
+## cron.json Schema
+
+The file lives at: `cron.json` (workspace root, same folder as `run.json`)
+
+```json
+{
+  "jobs": {
+    "alias-name": {
+      "cmd": "shell command to execute",
+      "description": "Human-readable label shown in /cron listing",
+      "schedule": "every 30m",
+      "timeout": 60,
+      "notify": "always",
+      "enabled": true
+    }
+  },
+  "defaults": {
+    "timeout": 30,
+    "notify": "always",
+    "chat_id": null
+  }
+}
+```
+
+### Job Fields
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cmd` | string | **required** | The shell command to run |
+| `description` | string | `""` | Short label shown in `/cron` |
+| `schedule` | string | **required** | When to run (see Schedule Expressions) |
+| `timeout` | int | `30` | Max seconds before the process is killed |
+| `notify` | string | `"always"` | When to message the user (see Notify Modes) |
+| `enabled` | bool | `true` | Set to `false` to pause without deleting |
+
+### Schedule Expressions
+
+| Expression | Meaning | Examples |
+|---|---|---|
+| `every Xs` | Every X seconds | `every 30s` |
+| `every Xm` | Every X minutes | `every 5m`, `every 30m` |
+| `every Xh` | Every X hours | `every 1h`, `every 6h` |
+| `at HH:MM` | Daily at a fixed time | `at 09:00`, `at 23:30` |
+| `at HH:MM weekday=DAY` | Weekly on a specific day | `at 09:00 weekday=mon` |
+| `once YYYY-MM-DD HH:MM` | One-shot at exact datetime | `once 2026-05-21 14:00` |
+
+Valid weekday values: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`
+
+### Notify Modes
+| Mode | When is the user notified? |
+|---|---|
+| `always` | After every run, success or failure |
+| `on_failure` | Only when exit code ≠ 0 |
+| `on_output` | Only when the command produces output |
+| `never` | Silent — runs but never messages |
+
+## How to Add a Cron Job
+
+When the user asks to add a scheduled job:
+
+1. Read the current `cron.json`
+2. Choose the right schedule expression
+3. Add the new entry under `jobs`
+4. Write the updated JSON back to `cron.json`
+5. Confirm to the user and remind them to use `/cron` to verify
+
+### Example: "Check disk space every 6 hours"
+
+```json
+{
+  "jobs": {
+    "disk-check": {
+      "cmd": "powershell Get-PSDrive -PSProvider FileSystem",
+      "description": "Check disk space usage",
+      "schedule": "every 6h",
+      "timeout": 15,
+      "notify": "always"
+    }
+  }
+}
+```
+
+### Example: "Send me a good morning at 8am every day"
+
+```json
+{
+  "jobs": {
+    "good-morning": {
+      "cmd": "echo Good morning! Have a great day.",
+      "description": "Daily morning greeting",
+      "schedule": "at 08:00",
+      "timeout": 5,
+      "notify": "always"
+    }
+  }
+}
+```
+
+### Example: "One-time reminder on a specific date"
+
+```json
+{
+  "jobs": {
+    "reminder": {
+      "cmd": "echo REMINDER: Deploy v2.1 today!",
+      "description": "One-time deployment reminder",
+      "schedule": "once 2026-05-25 15:00",
+      "timeout": 5,
+      "notify": "always"
+    }
+  }
+}
+```
+
+## How to Remove/Disable a Job
+
+- **Remove**: Delete the job's key from the `jobs` dict
+- **Disable**: Set `"enabled": false` (keeps config, pauses execution)
+- **Via Telegram**: User can also use `/cron disable alias` or `/cron enable alias`
+
+## Safety Guidelines
+
+- **No secrets in `cmd`**: Use environment variables or scripts for sensitive data
+- **Use scripts for complex logic**: Put multi-step logic in `scripts/` folder
+- **Set realistic timeouts**: Jobs run serially — a hung job blocks others
+- **Use `notify: "on_failure"`** for health checks to reduce noise
+- **Test first**: Run the command via `/run` before scheduling it
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Template: cron.json — Starter scheduled jobs config (empty)
+# ─────────────────────────────────────────────────────────────────────────────
+CRON_JSON = json.dumps({
+    "jobs": {},
+    "defaults": {
+        "timeout": 30,
+        "notify": "always",
+        "chat_id": None
+    }
+}, indent=2)
+
 
 # =============================================================================
 # Main scaffolding function — called by bot.py at startup
@@ -516,6 +802,42 @@ def init_workspace(work_dir: Path) -> bool:
     if not state_file.exists():
         state_file.write_text(PROCESSED_SESSIONS_JSON + "\n", encoding="utf-8")
         logger.info("  Created: state/processed_sessions.json")
+
+    # ── Write run-commands skill (only if missing) ───────────────────────
+    # This skill teaches the agent how to help users create and manage
+    # preset /run commands by editing run.json.
+    run_skill_dir = work_dir / "skills" / "run-commands"
+    run_skill_md = run_skill_dir / "SKILL.md"
+    if not run_skill_md.exists():
+        run_skill_dir.mkdir(parents=True, exist_ok=True)
+        run_skill_md.write_text(RUN_COMMANDS_SKILL_MD.strip() + "\n", encoding="utf-8")
+        logger.info("  Created: skills/run-commands/SKILL.md")
+
+    # ── Write starter run.json (only if missing) ─────────────────────────
+    # Empty commands dict so the file exists and is ready for the user/agent
+    # to populate. The bot reads this file on every /run invocation.
+    run_json_file = work_dir / "run.json"
+    if not run_json_file.exists():
+        run_json_file.write_text(RUN_JSON + "\n", encoding="utf-8")
+        logger.info("  Created: run.json")
+
+    # ── Write cron-scheduler skill (only if missing) ─────────────────────
+    # This skill teaches the agent how to help users create and manage
+    # scheduled automation jobs by editing cron.json.
+    cron_skill_dir = work_dir / "skills" / "cron-scheduler"
+    cron_skill_md = cron_skill_dir / "SKILL.md"
+    if not cron_skill_md.exists():
+        cron_skill_dir.mkdir(parents=True, exist_ok=True)
+        cron_skill_md.write_text(CRON_SCHEDULER_SKILL_MD.strip() + "\n", encoding="utf-8")
+        logger.info("  Created: skills/cron-scheduler/SKILL.md")
+
+    # ── Write starter cron.json (only if missing) ───────────────────────
+    # Empty jobs dict so the file exists and is ready for the user/agent
+    # to populate. The gateway scheduler reads this file on every hot-reload.
+    cron_json_file = work_dir / "cron.json"
+    if not cron_json_file.exists():
+        cron_json_file.write_text(CRON_JSON + "\n", encoding="utf-8")
+        logger.info("  Created: cron.json")
 
     if is_new:
         logger.info("=" * 60)

@@ -64,6 +64,8 @@ The setup script will:
 | 🕵️ **Private mode** | Toggle transcript logging per session with `/private` |
 | ⚡ **Auto-tool approval** | File edits, shell commands, web search — all auto-approved |
 | 🛑 **Task cancellation** | `/kill` stops a long-running task without resetting the session |
+| 🚀 **Preset commands (`/run`)** | Execute predefined shell commands instantly — bypasses Gemini entirely, zero latency |
+| ⏰ **Cron scheduler** | Automate recurring tasks — runs on the gateway, survives bot restarts, sends output to Telegram |
 | 🖥️ **Cross-platform service** | Windows (NSSM), Linux (systemd), macOS (launchd) — all via one setup script |
 | 🔄 **Watchdog gateway** | Exponential backoff restart if the agent process crashes |
 | 🔍 **Startup CLI validation** | Gateway checks Gemini CLI path on start, warns early if misconfigured |
@@ -242,6 +244,8 @@ Expected output:
 | `/kill` | Cancel the active long-running request without resetting the session |
 | `/private` | Toggle private mode — disables transcript logging for this session |
 | `/status` | Show ACP subprocess status (PID, session ID, timeout) |
+| `/run` | Execute a preset command from `run.json` — bypasses Gemini entirely |
+| `/cron` | View and manage scheduled automation jobs from `cron.json` |
 | *(any text)* | Forwards the message to Gemini and replies with the response |
 
 ### File Handling
@@ -271,12 +275,18 @@ On first run with a new working directory, `workspace_init.py` creates:
 ├── TODO.md                <- Task tracker
 ├── TOOLS.md               <- Environment-specific notes (SSH, devices, etc.)
 ├── HALLUCINATIONS.md      <- Hallucination tracking policy
+├── run.json               <- Preset commands for /run (see below)
+├── cron.json              <- Scheduled automation jobs for /cron (see below)
 ├── memory/                <- Daily memory logs (YYYY-MM-DD.md)
 ├── skills/
-│   └── memory-agent/
-│       ├── SKILL.md       <- Memory distillation skill documentation
-│       └── scripts/
-│           └── distill.py <- Transcript -> memory summary tool
+│   ├── memory-agent/
+│   │   ├── SKILL.md       <- Memory distillation skill documentation
+│   │   └── scripts/
+│   │       └── distill.py <- Transcript -> memory summary tool
+│   ├── run-commands/
+│   │   └── SKILL.md       <- Teaches agent to manage /run commands
+│   └── cron-scheduler/
+│       └── SKILL.md       <- Teaches agent to manage cron jobs
 ├── projects/              <- Project-specific work folders
 ├── scripts/               <- User/agent scripts
 ├── transcripts/           <- Raw session transcripts (auto-logged)
@@ -301,6 +311,68 @@ The included `skills/memory-agent/scripts/distill.py` converts raw session trans
 ```bash
 python <GEMINI_WORKING_DIR>/skills/memory-agent/scripts/distill.py --workspace <GEMINI_WORKING_DIR>
 ```
+
+### Preset Commands (`/run`)
+
+Execute predefined shell commands instantly — **bypasses Gemini entirely**, so there's zero latency. Commands are defined in `run.json`:
+
+```json
+{
+  "commands": {
+    "sysinfo": {
+      "cmd": "systeminfo",
+      "description": "Show system information",
+      "timeout": 15
+    },
+    "hello": "echo Hello from Gelegram!"
+  }
+}
+```
+
+- `/run` — lists all available commands with descriptions
+- `/run sysinfo` — runs the command and sends stdout back to Telegram
+- `/run hello world` — appends extra args: `echo Hello from Gelegram! world`
+- Ask the agent *"add a run command for checking disk space"* and it edits `run.json` for you via the skill
+
+### Cron Scheduler (`/cron`)
+
+Automate recurring tasks with a built-in cron system. Jobs are defined in `cron.json` and executed by a scheduler thread running inside `gateway.py` — it **survives bot restarts** and runs 24/7:
+
+```json
+{
+  "jobs": {
+    "health-check": {
+      "cmd": "python scripts/health.py",
+      "description": "Check service health",
+      "schedule": "every 30m",
+      "timeout": 30,
+      "notify": "on_failure"
+    },
+    "daily-backup": {
+      "cmd": "python scripts/backup.py",
+      "schedule": "at 02:30",
+      "notify": "always"
+    }
+  }
+}
+```
+
+**Schedule expressions** (human-readable, no crontab):
+
+| Expression | Meaning |
+|---|---|
+| `every 30s` / `every 5m` / `every 2h` | Interval-based |
+| `at 09:00` | Daily at a fixed time |
+| `at 09:00 weekday=mon` | Weekly on a specific day |
+| `once 2026-05-21 14:00` | One-shot at exact datetime (auto-disables after firing) |
+
+**Notify modes:** `always` · `on_failure` · `on_output` · `never`
+
+- `/cron` — lists all jobs with status and last run info
+- `/cron health-check` — show detail for a specific job
+- `/cron disable health-check` / `/cron enable health-check` — toggle jobs
+- Ask the agent *"schedule a cron job to check disk space every 6 hours"* and it edits `cron.json` for you via the skill
+- **Hot-reload:** the scheduler watches `cron.json` every 60s — no restart needed
 
 ---
 
@@ -386,6 +458,7 @@ launchctl unload "$PLIST" && rm "$PLIST"
 | **Orphan cleanup** | Kills leftover `bot.py` processes from previous runs (via `bot.pid` + psutil) |
 | **Graceful shutdown** | Handles SIGINT / SIGTERM / CTRL+BREAK cleanly |
 | **CLI path validation** | Checks Gemini CLI exists on startup; warns with install hint if missing |
+| **Cron scheduler** | Runs scheduled jobs in a daemon thread — survives bot restarts |
 | **Separate logging** | All lifecycle events go to `gateway.log` |
 
 ---
@@ -453,8 +526,9 @@ Telegram has a 4096-character message limit. Long responses are automatically sp
 
 ```
 gelegram/
-├── bot.py                <- Main bot: Telegram polling + GeminiACPClient
-├── gateway.py            <- Watchdog: auto-restarts bot.py with backoff (cross-platform)
+├── bot.py                <- Main bot: Telegram polling + GeminiACPClient + /run + /cron
+├── gateway.py            <- Watchdog: auto-restarts bot.py + hosts cron scheduler
+├── scheduler.py          <- Cron scheduler engine (pure stdlib, daemon thread)
 ├── workspace_init.py     <- Scaffolds agentic workspace on first run
 ├── chat.py               <- (utility module)
 ├── setup.ps1             <- One-command onboarding script (Windows)

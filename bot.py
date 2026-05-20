@@ -977,7 +977,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /memory   – Warm up session (load memory & identity)\n"
         "  /private  – Toggle private mode (no logging)\n"
         "  /status   – Check the ACP subprocess status\n"
-        "  /kill     – Cancel active request"
+        "  /kill     – Cancel active request\n"
+        "  /run      – Run a preset command (see run.json)\n"
+        "  /cron     – View & manage scheduled automation jobs"
     )
     # Auto-load memory so the user can chat immediately
     await cmd_memory(update, context)
@@ -1339,10 +1341,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     typing_task = asyncio.create_task(keep_typing())
 
+    # Track the timeout warning message so we can delete it once a response is ready.
+    timeout_msg = None
+
     async def notify_timeout():
-        await update.message.reply_text(
-            "⏱️ Gemini is taking longer than expected. I will message you as soon as I get a response!"
-        )
+        nonlocal timeout_msg
+        try:
+            # We send a message if taking longer to respond, but we store the reference
+            # to delete it later when our bot is ready to reply.
+            timeout_msg = await update.message.reply_text(
+                "⏱️ Gemini is taking longer than expected. I will message you as soon as I get a response!"
+            )
+        except Exception as e:
+            logger.error("Error sending timeout warning message: %s", e)
 
     try:
         acp_client = get_client(chat_id)
@@ -1386,6 +1397,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _status_msg.delete()
             except Exception:
                 pass  # ignore if already deleted or permission issue
+
+        # Delete the timeout warning message if it was sent, now that the reply is ready or has failed.
+        if timeout_msg is not None:
+            try:
+                await timeout_msg.delete()
+            except Exception as e:
+                logger.debug("Failed to delete timeout warning message: %s", e)
 
     import re
     import os
@@ -1443,6 +1461,437 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await update.message.reply_text(f"⚠️ Gemini tried to attach a file, but it wasn't found:\n`{file_path}`")
 # ─────────────────────────────────────────────────────────────────────────────
+# /run command — Direct preset command executor (bypasses Gemini)
+# ─────────────────────────────────────────────────────────────────────────────
+# Reads command aliases from workdir/run.json and executes them as shell
+# subprocesses. Output (stdout + stderr) is sent back to the user as a
+# Telegram message. This path does NOT involve Gemini CLI at all — it's a
+# lightweight escape hatch for frequently-used commands.
+#
+# Auth: Uses the same trusted_users / BOT_PASSWORD gate as handle_message.
+# Security: Only commands defined in run.json can be executed. User-supplied
+#           args are appended to the command string (not interpolated).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def load_run_config() -> dict | None:
+    """
+    Load and parse the run.json config from GEMINI_WORKING_DIR.
+
+    Re-reads the file on every call (no caching) so edits are picked up
+    instantly without a bot restart.
+
+    Returns the parsed dict or None if the file is missing/malformed.
+    """
+    run_json_path = Path(GEMINI_WORKING_DIR) / "run.json"
+    if not run_json_path.exists():
+        return None
+    try:
+        with open(run_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Basic validation: must have a "commands" dict at minimum
+        if not isinstance(data.get("commands"), dict):
+            logger.warning("run.json is missing 'commands' dict — ignoring.")
+            return None
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to load run.json: %s", exc)
+        return None
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /run — execute a preset command from run.json.
+
+    Usage:
+      /run                  → list all available command aliases
+      /run <alias>          → execute the command mapped to <alias>
+      /run <alias> <args>   → execute with extra arguments appended
+
+    The command runs as a shell subprocess in GEMINI_WORKING_DIR.
+    stdout and stderr are captured and sent back as a Telegram message.
+    A per-command timeout is enforced (default 30s).
+
+    Auth: same trusted_users check as handle_message — unauthenticated
+    users are rejected with a password prompt.
+    """
+    chat_id = update.effective_chat.id
+
+    # ── Auth gate (same logic as handle_message) ─────────────────────────
+    if BOT_PASSWORD and chat_id not in trusted_users:
+        await update.message.reply_text("🔒 Please provide the bot password to use this bot.")
+        return
+
+    # ── Load run.json ────────────────────────────────────────────────────
+    config = load_run_config()
+    commands = config.get("commands", {}) if config else {}
+    defaults = config.get("defaults", {}) if config else {}
+    default_timeout = defaults.get("timeout", 30)
+
+    # ── Parse arguments ──────────────────────────────────────────────────
+    # context.args is a list of words after /run (PTB splits on whitespace)
+    args = context.args or []
+
+    # ── No arguments: list available commands ────────────────────────────
+    if not args:
+        if not commands:
+            await update.message.reply_text(
+                "📋 No commands configured yet.\n\n"
+                "Create `run.json` in your workspace or ask Gemini:\n"
+                '"Add a run command called check-mail that runs python scripts/check_mail.py"'
+            )
+            return
+
+        # Build a nice listing of available commands
+        lines = ["📋 **Available /run commands:**\n"]
+        for alias, entry in commands.items():
+            desc = entry.get("description", "") if isinstance(entry, dict) else ""
+            timeout = entry.get("timeout", default_timeout) if isinstance(entry, dict) else default_timeout
+            desc_part = f" — {desc}" if desc else ""
+            lines.append(f"  `{alias}`{desc_part}  ⏱️{timeout}s")
+        lines.append(f"\nUsage: `/run <command> [args]`")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # ── Look up the alias ────────────────────────────────────────────────
+    alias = args[0].lower()
+    extra_args = args[1:]  # everything after the alias
+
+    if alias not in commands:
+        # Suggest similar aliases if any exist
+        suggestions = [a for a in commands if alias in a or a in alias]
+        msg = f"❌ Unknown command: `{alias}`"
+        if suggestions:
+            msg += f"\n\nDid you mean: {', '.join(f'`{s}`' for s in suggestions)}?"
+        elif commands:
+            msg += f"\n\nAvailable: {', '.join(f'`{a}`' for a in commands)}"
+        else:
+            msg += "\n\nNo commands configured. Create `run.json` in your workspace."
+        await update.message.reply_text(msg)
+        return
+
+    # ── Resolve command config ───────────────────────────────────────────
+    entry = commands[alias]
+    # Support both string shorthand ("alias": "command") and full dict form
+    if isinstance(entry, str):
+        cmd_str = entry
+        timeout = default_timeout
+        allow_args = True
+        description = ""
+    elif isinstance(entry, dict):
+        cmd_str = entry.get("cmd", "")
+        timeout = entry.get("timeout", default_timeout)
+        allow_args = entry.get("args", True)
+        description = entry.get("description", "")
+    else:
+        await update.message.reply_text(f"❌ Invalid config for `{alias}` in run.json.")
+        return
+
+    if not cmd_str:
+        await update.message.reply_text(f"❌ Command `{alias}` has no 'cmd' defined in run.json.")
+        return
+
+    # ── Append extra args if allowed ─────────────────────────────────────
+    if extra_args and allow_args:
+        cmd_str = cmd_str + " " + " ".join(extra_args)
+    elif extra_args and not allow_args:
+        await update.message.reply_text(
+            f"⚠️ Command `{alias}` does not accept arguments.\n"
+            f"Running without args: `{cmd_str}`"
+        )
+
+    # ── Execute ──────────────────────────────────────────────────────────
+    logger.info("/run executing: alias=%s cmd='%s' timeout=%s user=%s",
+                alias, cmd_str, timeout, update.effective_user.full_name if update.effective_user else "?")
+
+    # Send immediate feedback so the user knows the command is running
+    status_msg = await update.message.reply_text(f"⚡ Running `{alias}` …")
+
+    try:
+        # Run via shell so pipes, env vars, and complex commands all work
+        proc = await asyncio.create_subprocess_shell(
+            cmd_str,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=GEMINI_WORKING_DIR,
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Kill the process if it exceeds the timeout
+            proc.kill()
+            await proc.wait()
+            await status_msg.edit_text(
+                f"⏱️ Command `{alias}` timed out after {timeout}s and was killed."
+            )
+            logger.warning("/run timeout: alias=%s after %ss", alias, timeout)
+            return
+
+        # Decode output
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        exit_code = proc.returncode
+
+        # ── Build response message ───────────────────────────────────────
+        parts = []
+        if exit_code == 0:
+            parts.append(f"✅ `{alias}` completed (exit 0)")
+        else:
+            parts.append(f"⚠️ `{alias}` exited with code {exit_code}")
+
+        if stdout_text:
+            # Truncate to fit Telegram's 4096 char limit (leave room for metadata)
+            truncated = stdout_text[:3500]
+            if len(stdout_text) > 3500:
+                truncated += f"\n… ({len(stdout_text) - 3500} chars truncated)"
+            parts.append(f"```\n{truncated}\n```")
+
+        if stderr_text:
+            truncated_err = stderr_text[:1000]
+            if len(stderr_text) > 1000:
+                truncated_err += f"\n… ({len(stderr_text) - 1000} chars truncated)"
+            parts.append(f"⚠️ stderr:\n```\n{truncated_err}\n```")
+
+        if not stdout_text and not stderr_text:
+            parts.append("_(no output)_")
+
+        response = "\n".join(parts)
+
+        # Delete the "Running …" status and send the final response
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        # Split if needed (Telegram 4096 char limit)
+        if len(response) <= 4000:
+            await update.message.reply_text(response)
+        else:
+            chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)]
+            for i, chunk in enumerate(chunks, 1):
+                await update.message.reply_text(f"[Part {i}/{len(chunks)}]\n{chunk}")
+
+        logger.info("/run completed: alias=%s exit=%s stdout=%d bytes stderr=%d bytes",
+                    alias, exit_code, len(stdout_text), len(stderr_text))
+
+    except Exception as exc:
+        logger.exception("/run failed: alias=%s cmd='%s'", alias, cmd_str)
+        try:
+            await status_msg.edit_text(f"❌ Failed to run `{alias}`: `{exc}`")
+        except Exception:
+            await update.message.reply_text(f"❌ Failed to run `{alias}`: `{exc}`")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /cron command — View and manage scheduled automation jobs
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only listing of jobs defined in workdir/cron.json (which the scheduler
+# in gateway.py actually executes). Also supports enable/disable toggles that
+# edit cron.json directly — the scheduler hot-reloads within 60s.
+#
+# Note: The scheduler runs in gateway.py, NOT here. bot.py only reads/writes
+# cron.json and displays status — it has no live handle on the scheduler object.
+# For real-time status (last_run, exit_code) we read the .cron_state.json file
+# that scheduler.py writes after every execution.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_cron_config() -> dict | None:
+    """
+    Read workdir/cron.json and return the parsed dict.
+    Returns None if the file is missing or malformed.
+    """
+    cron_path = Path(GEMINI_WORKING_DIR) / "cron.json"
+    if not cron_path.exists():
+        return None
+    try:
+        with open(cron_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data.get("jobs"), dict):
+            return None
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to read cron.json: %s", exc)
+        return None
+
+
+def _load_cron_state() -> dict:
+    """
+    Read workdir/.cron_state.json written by scheduler.py after each job run.
+    Returns empty dict if missing or malformed.
+    """
+    state_path = Path(GEMINI_WORKING_DIR) / ".cron_state.json"
+    if not state_path.exists():
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_cron_config(data: dict) -> bool:
+    """
+    Write updated cron.json back to workdir.
+    Returns True on success.
+    """
+    cron_path = Path(GEMINI_WORKING_DIR) / "cron.json"
+    try:
+        with open(cron_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        return True
+    except OSError as exc:
+        logger.error("Failed to write cron.json: %s", exc)
+        return False
+
+
+async def cmd_cron(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /cron — view and manage scheduled automation jobs.
+
+    Usage:
+      /cron                         → list all jobs with status & next run
+      /cron <alias>                 → show detail for one job
+      /cron enable <alias>          → enable a disabled job
+      /cron disable <alias>         → disable a running job
+
+    Jobs are defined in workdir/cron.json and executed by the scheduler
+    running in gateway.py. Edits here are hot-reloaded by the scheduler
+    within ~60 seconds.
+
+    Auth: same trusted_users check as handle_message.
+    """
+    chat_id = update.effective_chat.id
+
+    # ── Auth gate ───────────────────────────────────────────────────
+    if BOT_PASSWORD and chat_id not in trusted_users:
+        await update.message.reply_text("🔒 Please provide the bot password to use this bot.")
+        return
+
+    args = context.args or []
+    config = _load_cron_config()
+    jobs = config.get("jobs", {}) if config else {}
+    state = _load_cron_state()
+
+    # ── Sub-command: enable/disable ────────────────────────────────────
+    if len(args) >= 2 and args[0].lower() in ("enable", "disable"):
+        action = args[0].lower()
+        alias = args[1].lower()
+
+        if not config:
+            await update.message.reply_text("❌ No cron.json found in workspace.")
+            return
+        if alias not in jobs:
+            await update.message.reply_text(f"❌ Unknown job: `{alias}`")
+            return
+
+        target_state = action == "enable"
+        entry = config["jobs"][alias]
+        if isinstance(entry, dict):
+            entry["enabled"] = target_state
+        else:
+            # String shorthand — upgrade to dict form
+            config["jobs"][alias] = {"cmd": entry, "enabled": target_state}
+
+        if _save_cron_config(config):
+            emoji = "✅" if target_state else "⏸️"
+            await update.message.reply_text(
+                f"{emoji} Job `{alias}` {action}d.\n"
+                f"_Scheduler will pick up the change within ~60 seconds._"
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed to update cron.json.")
+        return
+
+    # ── Sub-command: show detail for one job ───────────────────────────
+    if len(args) == 1 and args[0].lower() not in ("enable", "disable"):
+        alias = args[0].lower()
+        if alias not in jobs:
+            suggestions = [a for a in jobs if alias in a or a in alias]
+            msg = f"❌ Unknown job: `{alias}`"
+            if suggestions:
+                msg += f"\nDid you mean: {', '.join(f'`{s}`' for s in suggestions)}?"
+            elif jobs:
+                msg += f"\nAvailable: {', '.join(f'`{a}`' for a in jobs)}"
+            await update.message.reply_text(msg)
+            return
+
+        entry = jobs[alias]
+        if isinstance(entry, str):
+            entry = {"cmd": entry}
+
+        job_state = state.get(alias, {})
+        last_run = job_state.get("last_run", "Never")
+        last_exit = job_state.get("last_exit_code")
+        enabled = entry.get("enabled", True)
+        status_emoji = "✅" if enabled else "⏸️"
+        exit_str = (
+            f"✅ 0" if last_exit == 0
+            else f"⚠️ {last_exit}" if last_exit is not None
+            else "N/A"
+        )
+
+        lines = [
+            f"🕒 **Cron job: `{alias}`**",
+            f"Status:      {status_emoji} {'Enabled' if enabled else 'Disabled'}",
+            f"Command:     `{entry.get('cmd', '?')}`",
+            f"Schedule:    `{entry.get('schedule', '?')}`",
+            f"Timeout:     {entry.get('timeout', 30)}s",
+            f"Notify:      {entry.get('notify', 'always')}",
+            f"Description: {entry.get('description', '(none)')}",
+            f"Last run:    {last_run}",
+            f"Last exit:   {exit_str}",
+            f"",
+            f"_`/cron disable {alias}` to pause | `/cron enable {alias}` to resume_",
+        ]
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # ── No args: list all jobs ─────────────────────────────────────────
+    if not jobs:
+        await update.message.reply_text(
+            "🕒 No cron jobs configured yet.\n\n"
+            "Ask Gemini to add one, for example:\n"
+            '"Add a cron job to check disk space every 6 hours"'
+        )
+        return
+
+    lines = ["🕒 **Scheduled Jobs:**\n"]
+    for alias, entry in jobs.items():
+        if isinstance(entry, str):
+            entry = {"cmd": entry}
+
+        enabled = entry.get("enabled", True)
+        schedule = entry.get("schedule", "?")
+        desc = entry.get("description", "")
+        job_state = state.get(alias, {})
+        last_run = job_state.get("last_run", "Never")
+        last_exit = job_state.get("last_exit_code")
+
+        status_icon = "✅" if enabled else "⏸️"
+        exit_icon = (
+            " ✅" if last_exit == 0
+            else f" ⚠️({last_exit})" if last_exit is not None
+            else ""
+        )
+        # Trim last_run to just the time part for compactness
+        last_run_short = last_run[:16] if last_run != "Never" else "Never"
+        desc_part = f" — {desc}" if desc else ""
+
+        lines.append(
+            f"{status_icon} `{alias}`{desc_part}\n"
+            f"   ⏰ `{schedule}` | Last: {last_run_short}{exit_icon}"
+        )
+
+    lines.append(f"\n`/cron <alias>` for details | `/cron disable/enable <alias>` to toggle")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1469,6 +1918,8 @@ def main() -> None:
             BotCommand("private", "Toggle private mode (no logging)"),
             BotCommand("status",  "Check ACP subprocess status"),
             BotCommand("kill",    "Cancel active request"),
+            BotCommand("run",     "Run a preset command from run.json"),
+            BotCommand("cron",    "View & manage scheduled automation jobs"),
         ])
 
     # Build the Application (v20+ PTB style)
@@ -1488,6 +1939,8 @@ def main() -> None:
     application.add_handler(CommandHandler("kill",    cmd_kill))
     application.add_handler(CommandHandler("private", cmd_private))
     application.add_handler(CommandHandler("status",  cmd_status))
+    application.add_handler(CommandHandler("run",     cmd_run))
+    application.add_handler(CommandHandler("cron",    cmd_cron))
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€       
     application.add_handler(

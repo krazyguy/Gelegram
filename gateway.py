@@ -36,6 +36,11 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
+# Cron scheduler — runs as a daemon thread alongside the bot watchdog loop.
+# Reads job definitions from workdir/cron.json and executes them on schedule,
+# sending output to Telegram via raw HTTP POST (no python-telegram-bot dep).
+from scheduler import CronScheduler
+
 # psutil is used for orphan-process cleanup (pip install psutil)
 try:
     import psutil
@@ -73,6 +78,13 @@ TELEGRAM_COOLDOWN = 5
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging – separate from bot.log to keep gateway lifecycle events distinct
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX: On Windows the default stdout encoding is cp1252, which can't handle
+# emoji/unicode characters (…, →, etc.) that bot.py logs.  Reconfigure stdout
+# to UTF-8 with errors='replace' so those chars are rendered instead of
+# crashing the StreamHandler with UnicodeEncodeError.
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | gateway | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -336,6 +348,33 @@ def main():
     logger.info("  PID        : %s", os.getpid())
     logger.info("=" * 60)
 
+    # ── Start the Cron Scheduler ──────────────────────────────────────────
+    # The scheduler runs in a daemon thread — it reads workdir/cron.json,
+    # executes commands on schedule, and sends output to Telegram via raw
+    # HTTP POST. It survives bot.py restarts since it's part of the gateway.
+    #
+    # Resolve workdir from .env (same logic as bot.py uses).
+    # _validate_environment() already called load_dotenv(), so GEMINI_WORKING_DIR
+    # and TELEGRAM_BOT_TOKEN are available in os.environ.
+    workdir = os.environ.get("GEMINI_WORKING_DIR", str(SCRIPT_DIR / "workdir"))
+    workdir_path = Path(workdir)
+    if not workdir_path.is_absolute():
+        workdir_path = SCRIPT_DIR / workdir_path
+    workdir = str(workdir_path)
+
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    scheduler = None
+
+    if telegram_token:
+        scheduler = CronScheduler(workdir=workdir, telegram_token=telegram_token)
+        scheduler.start()
+        logger.info("Cron scheduler started (workdir=%s)", workdir)
+    else:
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN not set — cron scheduler disabled "
+            "(no way to send notifications)."
+        )
+
     current_delay = RESTART_DELAY
     restart_count = 0
 
@@ -411,6 +450,12 @@ def main():
             current_delay = min(current_delay * 2, MAX_RESTART_DELAY)
 
     logger.info("Gateway shutdown complete. Total restarts: %d", restart_count)
+
+    # ── Stop the Cron Scheduler ───────────────────────────────────────────
+    if scheduler is not None:
+        logger.info("Stopping cron scheduler …")
+        scheduler.stop()
+        logger.info("Cron scheduler stopped.")
 
 
 def _format_duration(seconds: float) -> str:
